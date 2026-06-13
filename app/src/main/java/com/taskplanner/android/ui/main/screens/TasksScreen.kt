@@ -492,6 +492,7 @@ fun TasksScreen(
         CalendarDialog(
             selectedDate = selectedDate,
             tasks = calendarTasks,
+            onMonthChanged = { vm.setCalendarMonth(it) },
             onSelect = { vm.selectDate(it) },
             onDismiss = { showingCalendar = false }
         )
@@ -1660,13 +1661,13 @@ private fun RowScope.PriorityChip(title: String, color: Color, selected: Boolean
 private fun CalendarDialog(
     selectedDate: LocalDate,
     tasks: List<TaskEntity>,
+    onMonthChanged: (YearMonth) -> Unit,
     onSelect: (LocalDate) -> Unit,
     onDismiss: () -> Unit
 ) {
     var currentMonth by remember { mutableStateOf(YearMonth.from(selectedDate)) }
     val today = remember { LocalDate.now() }
 
-    
     val monthTasksRaw by rememberUpdatedState(tasks)
 
     AlertDialog(
@@ -1679,12 +1680,12 @@ private fun CalendarDialog(
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    TextButton(onClick = { currentMonth = currentMonth.minusMonths(1) }) { Text("←") }
+                    IconButton(onClick = { currentMonth = currentMonth.minusMonths(1); onMonthChanged(currentMonth) }, modifier = Modifier.size(40.dp)) { Text("←", fontSize = 22.sp, fontWeight = FontWeight.Bold, color = AppColors.Blue) }
                     Text(
                         text = "${currentMonth.month.getDisplayName(TextStyle.FULL_STANDALONE, Locale("ru")).replaceFirstChar { it.uppercase() }} ${currentMonth.year}",
                         style = MaterialTheme.typography.titleMedium
                     )
-                    TextButton(onClick = { currentMonth = currentMonth.plusMonths(1) }) { Text("→") }
+                    IconButton(onClick = { currentMonth = currentMonth.plusMonths(1); onMonthChanged(currentMonth) }, modifier = Modifier.size(40.dp)) { Text("→", fontSize = 22.sp, fontWeight = FontWeight.Bold, color = AppColors.Blue) }
                 }
 
                 Row(modifier = Modifier.fillMaxWidth()) {
@@ -1711,7 +1712,10 @@ private fun CalendarDialog(
                     monthTasksRaw
                         .filter { it.deletedAt == null }
                         .groupBy { TimeUtils.localDateFromMillis(it.date) }
-                        .mapValues { it.value.size }
+                        .mapValues { (_, tasks) ->
+                            // Считаем родительские задачи + подзадачи
+                            tasks.size
+                        }
                 }
 
                 LazyVerticalGrid(

@@ -11,6 +11,7 @@ import com.taskplanner.android.data.local.entities.RecurrenceRuleEntity
 import com.taskplanner.android.data.local.entities.TaskEntity
 import com.taskplanner.android.sync.SyncTrigger
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.map
 import java.time.LocalDate
 import java.time.temporal.ChronoUnit
 import java.time.temporal.TemporalAdjusters
@@ -23,10 +24,30 @@ class RecurrenceRepository(
 ) {
     companion object {
         private const val LOOKAHEAD_DAYS: Long = 30L
-        private const val DAY_MILLIS: Long = 24L * 60L * 60L * 1000L
+        const val DAY_MILLIS: Long = 24L * 60L * 60L * 1000L
     }
 
-    fun observeRules(userId: String): Flow<List<RecurrenceRuleEntity>> = ruleDao.observeAll(userId)
+    fun observeRules(userId: String): Flow<List<RecurrenceRuleEntity>> =
+        ruleDao.observeAll(userId).map { rules ->
+
+            val bySource = mutableMapOf<String, RecurrenceRuleEntity>()
+            val noSource = mutableListOf<RecurrenceRuleEntity>()
+            for (rule in rules) {
+                val src = rule.sourceTaskId.takeIf { it.isNotBlank() }
+                if (src == null) {
+                    noSource += rule
+                } else {
+                    val existing = bySource[src]
+                    if (existing == null || (rule.createdAt ?: 0L) > (existing.createdAt ?: 0L)) {
+                        bySource[src] = rule
+                    }
+                }
+            }
+            (bySource.values.toList() + noSource).sortedByDescending { it.createdAt ?: 0L }
+        }
+
+    fun observeSourceTasks(userId: String, ids: List<String>): kotlinx.coroutines.flow.Flow<List<TaskEntity>> =
+        taskDao.observeByIds(userId, ids)
 
     suspend fun getSourceTasksByIds(userId: String, ids: List<String>): List<TaskEntity> {
         if (ids.isEmpty()) return emptyList()
@@ -173,36 +194,26 @@ class RecurrenceRepository(
         ))
 
         
-        val tomorrow = startOfDayMillis(java.time.LocalDate.now().plusDays(1))
-        val futureTasks = taskDao.getForRangeAny(userId, tomorrow, Long.MAX_VALUE)
-            .filter { it.recurrenceRuleId == ruleId && it.originType == TaskOriginType.RECURRENCE.raw && it.deletedAt == null }
-        futureTasks.forEach { t ->
-            val newStartTime = startTimeMillis?.let { stored ->
-                val localTime = com.taskplanner.android.core.util.TimeUtils.localTimeFromMillis(stored)
-                com.taskplanner.android.core.util.TimeUtils.millisFromLocalTime(localTime, com.taskplanner.android.core.util.TimeUtils.localDateFromMillis(t.date))
-            }
-            taskDao.upsert(t.copy(
-                title = title.trim(),
-                description = description?.takeIf { it.isNotBlank() },
-                startTime = newStartTime,
-                priority = priority,
-                hasReminder = hasReminder && newStartTime != null,
-                reminderOffsetMinutes = reminderOffsetMinutes,
-                categoryId = categoryId,
-                updatedAt = now,
-                syncStatus = SyncStatus.UPDATED_LOCAL.raw
-            ))
-        }
+        val today = startOfDayMillis(java.time.LocalDate.now())
+        val yesterday = today - DAY_MILLIS
 
-        
+
+        taskDao.softDeleteGeneratedForRuleFromDate(userId, ruleId, TaskOriginType.RECURRENCE.raw, today, now)
+
+        val updatedEndDate = endDate?.let { startOfDayMillis(it) }
+
         ruleDao.update(rule.copy(
             frequency = frequency.raw,
             intervalValue = maxOf(1, interval),
             weekdaysMask = weekdaysMask,
-            endDate = endDate?.let { startOfDayMillis(it) },
+            endDate = updatedEndDate,
+            lastGeneratedAt = yesterday,
             updatedAt = now,
             syncStatus = SyncStatus.UPDATED_LOCAL.raw
         ))
+
+        val updatedRule = ruleDao.getById(userId, ruleId) ?: return
+        generateTasksForRule(userId, updatedRule)
 
         syncTrigger.trigger()
     }
@@ -215,7 +226,8 @@ class RecurrenceRepository(
         val today = TimeUtils.startOfDayMillis(LocalDate.now())
         val cutoff = today + DAY_MILLIS
 
-        taskDao.hardDeleteGeneratedForRuleFromDate(userId, ruleId, TaskOriginType.RECURRENCE.raw, cutoff)
+
+        taskDao.softDeleteGeneratedForRuleFromDate(userId, ruleId, TaskOriginType.RECURRENCE.raw, cutoff, now)
 
         ruleDao.update(
             rule.copy(
@@ -250,13 +262,29 @@ class RecurrenceRepository(
     suspend fun deleteRecurrenceKeepingPast(userId: String, ruleId: String) {
         val rule = ruleDao.getById(userId, ruleId) ?: return
         val now = System.currentTimeMillis()
+        val today = TimeUtils.startOfDayMillis(LocalDate.now())
         val tomorrow = TimeUtils.startOfDayMillis(LocalDate.now().plusDays(1))
 
-        
-        taskDao.hardDeleteGeneratedForRuleFromDate(userId, ruleId, TaskOriginType.RECURRENCE.raw, tomorrow)
 
-        
-        taskDao.detachFromRule(userId, ruleId, now, SyncStatus.UPDATED_LOCAL.raw)
+        taskDao.softDeleteGeneratedForRuleFromDate(userId, ruleId, TaskOriginType.RECURRENCE.raw, tomorrow, now)
+
+
+        taskDao.softDeleteGeneratedForRuleFromDate(userId, ruleId, TaskOriginType.RECURRENCE.raw, today, now)
+
+
+        taskDao.detachFromRuleBefore(userId, ruleId, today, now, SyncStatus.UPDATED_LOCAL.raw)
+
+
+        val sourceTask = taskDao.getByIdAny(userId, rule.sourceTaskId)
+        if (sourceTask != null) {
+            taskDao.upsert(sourceTask.copy(
+                recurrenceRuleId = null,
+                instanceDate = null,
+                originType = com.taskplanner.android.core.model.TaskOriginType.MANUAL.raw,
+                updatedAt = now,
+                syncStatus = SyncStatus.UPDATED_LOCAL.raw
+            ))
+        }
 
         ruleDao.update(rule.copy(deletedAt = now, updatedAt = now, syncStatus = SyncStatus.DELETED_LOCAL.raw))
         syncTrigger.trigger()
@@ -295,10 +323,21 @@ class RecurrenceRepository(
     suspend fun softDeleteEntireSeries(userId: String, ruleId: String) {
         val rule = ruleDao.getById(userId, ruleId) ?: return
         val now = System.currentTimeMillis()
+        val sourceTaskId = rule.sourceTaskId
 
-        taskDao.hardDeleteAllGeneratedForRule(userId, ruleId, TaskOriginType.RECURRENCE.raw)
+        taskDao.softDeleteForRecurrenceRule(userId, ruleId, now, now, SyncStatus.DELETED_LOCAL.raw)
 
-        val source = taskDao.getById(userId, rule.sourceTaskId)
+
+        val allRulesForSource = ruleDao.getAllForSourceTask(userId, sourceTaskId)
+        for (otherRule in allRulesForSource) {
+            if (otherRule.id != ruleId) {
+                taskDao.softDeleteForRecurrenceRule(userId, otherRule.id, now, now, SyncStatus.DELETED_LOCAL.raw)
+                ruleDao.update(otherRule.copy(deletedAt = now, updatedAt = now, syncStatus = SyncStatus.DELETED_LOCAL.raw))
+            }
+        }
+
+
+        val source = taskDao.getByIdAny(userId, sourceTaskId)
         if (source != null) {
             taskDao.softDelete(userId, source.id, deletedAt = now, updatedAt = now, syncStatus = SyncStatus.DELETED_LOCAL.raw)
         }
@@ -346,7 +385,8 @@ class RecurrenceRepository(
                 val exists = taskDao.getForRangeAny(userId, dayMillis, endMillis).any { t ->
                     t.recurrenceRuleId == rule.id &&
                         t.originType == TaskOriginType.RECURRENCE.raw &&
-                        t.date == dayMillis
+                        t.date == dayMillis &&
+                        t.deletedAt == null
                 }
                 if (!exists) {
                     val minPos = taskDao.getMinPositionForDay(userId, dayMillis, endMillis) ?: 0

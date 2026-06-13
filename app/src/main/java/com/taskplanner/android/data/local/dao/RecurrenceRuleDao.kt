@@ -37,6 +37,9 @@ interface RecurrenceRuleDao {
     @Query("SELECT * FROM recurrence_rules WHERE sourceTaskId = :sourceTaskId AND userId = :userId AND deletedAt IS NULL ORDER BY createdAt DESC LIMIT 1")
     suspend fun getLatestForSourceTask(userId: String, sourceTaskId: String): RecurrenceRuleEntity?
 
+    @Query("SELECT * FROM recurrence_rules WHERE sourceTaskId = :sourceTaskId AND userId = :userId")
+    suspend fun getAllForSourceTask(userId: String, sourceTaskId: String): List<RecurrenceRuleEntity>
+
     @Query("SELECT * FROM recurrence_rules WHERE userId = :userId AND syncStatus != :syncedRaw")
     suspend fun getUnsynced(userId: String, syncedRaw: Int): List<RecurrenceRuleEntity>
 

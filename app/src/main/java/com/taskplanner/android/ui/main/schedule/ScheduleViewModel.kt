@@ -18,6 +18,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
@@ -106,14 +107,12 @@ class ScheduleViewModel(
             recurrenceRepository.generateUpcomingTasksIfNeeded(userId)
         }
         viewModelScope.launch {
-            rules.collect { ruleList ->
-                val ids = ruleList.map { it.sourceTaskId }.distinct()
-                if (ids.isEmpty()) {
-                    sourceTasksById.value = emptyMap()
-                } else {
-                    val tasks = recurrenceRepository.getSourceTasksByIds(userId, ids)
-                    sourceTasksById.value = tasks.associateBy { it.id }
-                }
+            rules.flatMapLatest { ruleList ->
+                val ids = ruleList.map { it.sourceTaskId }.filter { it.isNotBlank() }.distinct()
+                if (ids.isEmpty()) kotlinx.coroutines.flow.flowOf(emptyList())
+                else recurrenceRepository.observeSourceTasks(userId, ids)
+            }.collect { tasks ->
+                sourceTasksById.value = tasks.associateBy { it.id }
             }
         }
     }

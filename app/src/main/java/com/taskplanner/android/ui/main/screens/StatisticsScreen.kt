@@ -124,10 +124,17 @@ fun StatisticsScreen(padding: PaddingValues, userId: String) {
             }
         }
 
-        if (data.dailyCompletion.isNotEmpty()) {
+        val hasChartData = data.hourlyCompletion?.values?.any { it > 0 } == true ||
+            data.dailyCompletion.values.any { it > 0 }
+        if (hasChartData || data.dailyCompletion.isNotEmpty()) {
             item {
                 ChartCard(title = "Динамика выполнения") {
-                    DailyBars(daily = data.dailyCompletion)
+                    val hourly = data.hourlyCompletion
+                    if (hourly != null) {
+                        HourlyBars(hourly = hourly)
+                    } else {
+                        DailyBars(daily = data.dailyCompletion, period = period)
+                    }
                 }
             }
         }
@@ -280,26 +287,113 @@ private fun ChartCard(title: String, content: @Composable () -> Unit) {
 }
 
 @Composable
-private fun DailyBars(daily: Map<java.time.LocalDate, Int>) {
-    val max = (daily.values.maxOrNull() ?: 0).coerceAtLeast(1)
-    val formatter = DateTimeFormatter.ofPattern("d.MM")
+private fun DailyBars(daily: Map<java.time.LocalDate, Int>, period: com.taskplanner.android.data.repository.StatisticsPeriod) {
+    when (period) {
+        com.taskplanner.android.data.repository.StatisticsPeriod.WEEK -> {
+            // Неделя — 7 баров, подписи дней
+            val entries = daily.entries.toList()
+            val max = (entries.maxOfOrNull { it.value } ?: 0).coerceAtLeast(1)
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp), verticalAlignment = Alignment.Bottom) {
+                entries.forEach { (date, count) ->
+                    val h = (count.toFloat() / max).coerceIn(0f, 1f)
+                    val label = date.format(DateTimeFormatter.ofPattern("EE", java.util.Locale("ru"))).take(2).replaceFirstChar { it.uppercase() }
+                    Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.weight(1f)) {
+                        if (count > 0) Text("$count", fontSize = 9.sp, color = AppColors.Blue, fontWeight = FontWeight.SemiBold)
+                        else Spacer(Modifier.height(14.dp))
+                        Box(modifier = Modifier.fillMaxWidth().height((110 * h).dp.coerceAtLeast(if (count > 0) 6.dp else 2.dp))
+                            .background(if (count > 0) MaterialTheme.colorScheme.primary else Color(0xFFE5E5EA), RoundedCornerShape(topStart = 4.dp, topEnd = 4.dp)))
+                        Spacer(Modifier.height(4.dp))
+                        Text(label, fontSize = 9.sp, color = Color.Gray, maxLines = 1)
+                    }
+                }
+            }
+        }
+        com.taskplanner.android.data.repository.StatisticsPeriod.MONTH -> {
+            // Месяц — группируем по неделям (4-5 баров)
+            val byWeek = daily.entries.groupBy { it.key.get(java.time.temporal.WeekFields.ISO.weekOfWeekBasedYear()) }
+                .toSortedMap()
+                .map { (_, entries) -> entries.minOf { it.key } to entries.sumOf { it.value } }
+            val max = (byWeek.maxOfOrNull { it.second } ?: 0).coerceAtLeast(1)
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.Bottom) {
+                byWeek.forEach { (weekStart, count) ->
+                    val h = (count.toFloat() / max).coerceIn(0f, 1f)
+                    val label = weekStart.format(DateTimeFormatter.ofPattern("d MMM", java.util.Locale("ru")))
+                    Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.weight(1f)) {
+                        if (count > 0) Text("$count", fontSize = 9.sp, color = AppColors.Blue, fontWeight = FontWeight.SemiBold)
+                        else Spacer(Modifier.height(14.dp))
+                        Box(modifier = Modifier.fillMaxWidth().height((110 * h).dp.coerceAtLeast(if (count > 0) 6.dp else 2.dp))
+                            .background(if (count > 0) MaterialTheme.colorScheme.primary else Color(0xFFE5E5EA), RoundedCornerShape(topStart = 4.dp, topEnd = 4.dp)))
+                        Spacer(Modifier.height(4.dp))
+                        Text(label, fontSize = 8.sp, color = Color.Gray, maxLines = 1)
+                    }
+                }
+            }
+        }
+        com.taskplanner.android.data.repository.StatisticsPeriod.YEAR -> {
+            // Год — группируем по месяцам (12 баров)
+            val byMonth = daily.entries.groupBy { it.key.monthValue }
+                .toSortedMap()
+                .map { (month, entries) -> month to entries.sumOf { it.value } }
+            val max = (byMonth.maxOfOrNull { it.second } ?: 0).coerceAtLeast(1)
+            val monthNames = listOf("Янв","Фев","Мар","Апр","Май","Июн","Июл","Авг","Сен","Окт","Ноя","Дек")
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(3.dp), verticalAlignment = Alignment.Bottom) {
+                byMonth.forEach { (month, count) ->
+                    val h = (count.toFloat() / max).coerceIn(0f, 1f)
+                    Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.weight(1f)) {
+                        if (count > 0) Text("$count", fontSize = 8.sp, color = AppColors.Blue, fontWeight = FontWeight.SemiBold)
+                        else Spacer(Modifier.height(13.dp))
+                        Box(modifier = Modifier.fillMaxWidth().height((110 * h).dp.coerceAtLeast(if (count > 0) 6.dp else 2.dp))
+                            .background(if (count > 0) MaterialTheme.colorScheme.primary else Color(0xFFE5E5EA), RoundedCornerShape(topStart = 4.dp, topEnd = 4.dp)))
+                        Spacer(Modifier.height(4.dp))
+                        Text(monthNames.getOrElse(month - 1) { "" }, fontSize = 8.sp, color = Color.Gray, maxLines = 1)
+                    }
+                }
+            }
+        }
+        else -> {
+            // День — fallback (должен использоваться HourlyBars)
+            val entries = daily.entries.toList()
+            val max = (entries.maxOfOrNull { it.value } ?: 0).coerceAtLeast(1)
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp), verticalAlignment = Alignment.Bottom) {
+                entries.forEach { (date, count) ->
+                    val h = (count.toFloat() / max).coerceIn(0f, 1f)
+                    Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.weight(1f)) {
+                        Box(modifier = Modifier.fillMaxWidth().height((110 * h).dp.coerceAtLeast(2.dp))
+                            .background(if (count > 0) MaterialTheme.colorScheme.primary else Color(0xFFE5E5EA), RoundedCornerShape(topStart = 4.dp, topEnd = 4.dp)))
+                        Spacer(Modifier.height(4.dp))
+                        Text(date.format(DateTimeFormatter.ofPattern("d.MM")), fontSize = 8.sp, color = Color.Gray, maxLines = 1)
+                    }
+                }
+            }
+        }
+    }
+}
 
+@Composable
+private fun HourlyBars(hourly: Map<Int, Int>) {
+    val max = (hourly.values.maxOrNull() ?: 0).coerceAtLeast(1)
+    // Показываем только часы 0,6,12,18 как метки
     Row(
         modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        horizontalArrangement = Arrangement.spacedBy(2.dp),
         verticalAlignment = Alignment.Bottom
     ) {
-        daily.entries.forEach { (date, count) ->
+        (0..23).forEach { hour ->
+            val count = hourly[hour] ?: 0
             val h = (count.toFloat() / max.toFloat()).coerceIn(0f, 1f)
+            val label = if (hour % 6 == 0) "%02d".format(hour) else ""
             Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.weight(1f)) {
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height((120 * h).dp.coerceAtLeast(6.dp))
-                        .background(MaterialTheme.colorScheme.primary, RoundedCornerShape(6.dp))
+                        .height((100 * h).dp.coerceAtLeast(if (count > 0) 4.dp else 1.dp))
+                        .background(
+                            if (count > 0) MaterialTheme.colorScheme.primary else Color(0xFFE5E5EA),
+                            RoundedCornerShape(topStart = 3.dp, topEnd = 3.dp)
+                        )
                 )
-                Spacer(Modifier.height(6.dp))
-                Text(formatter.format(date), style = MaterialTheme.typography.labelSmall, color = Color.Gray, maxLines = 1)
+                Spacer(Modifier.height(4.dp))
+                Text(label, fontSize = 8.sp, color = Color.Gray, maxLines = 1)
             }
         }
     }

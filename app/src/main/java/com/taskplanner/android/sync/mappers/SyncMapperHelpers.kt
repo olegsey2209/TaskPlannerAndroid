@@ -1,11 +1,12 @@
 package com.taskplanner.android.sync.mappers
 
 import com.google.firebase.Timestamp
+import com.google.firebase.firestore.FieldValue
 
 object SyncMapperHelpers {
     
-    fun timestamp(epochMillis: Long?): Timestamp? {
-        if (epochMillis == null) return null
+    fun timestamp(epochMillis: Long?): Any {
+        if (epochMillis == null) return FieldValue.delete()
         val seconds = epochMillis / 1000L
         val nanos = ((epochMillis % 1000L) * 1_000_000L).toInt()
         return Timestamp(seconds, nanos)

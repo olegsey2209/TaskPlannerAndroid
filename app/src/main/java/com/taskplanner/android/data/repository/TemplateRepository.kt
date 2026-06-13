@@ -203,8 +203,7 @@ class TemplateRepository(
             val dayMillis = TimeUtils.startOfDayMillis(current)
             val endMillis = TimeUtils.startOfDayMillis(current.plusDays(1))
             for (item in dayItems) {
-                val alreadyExists = taskDao.getForRange(userId, dayMillis, endMillis).any { it.templateItemId == item.id && it.deletedAt == null }
-                if (alreadyExists) continue
+
 
                 val minPos = taskDao.getMinPositionForDay(userId, dayMillis, endMillis) ?: 0
                 val position = minPos - 1
@@ -254,8 +253,14 @@ class TemplateRepository(
     }
 
     suspend fun deleteTemplateApplication(userId: String, applicationId: String) {
-        taskDao.hardDeleteForTemplateApplication(userId, applicationId)
-        applicationDao.deleteById(userId, applicationId)
+        val application = applicationDao.getByIdAny(userId, applicationId) ?: return
+        val now = System.currentTimeMillis()
+        taskDao.softDeleteForTemplateApplication(userId, applicationId, now)
+        applicationDao.upsert(application.copy(
+            deletedAt = now,
+            updatedAt = now,
+            syncStatus = SyncStatus.DELETED_LOCAL.raw
+        ))
         syncTrigger.trigger()
     }
 

@@ -84,6 +84,9 @@ interface TaskDao {
     @Query("SELECT * FROM tasks WHERE id = :id AND userId = :userId LIMIT 1")
     suspend fun getByIdAny(userId: String, id: String): TaskEntity?
 
+    @Query("SELECT * FROM tasks WHERE userId = :userId AND id IN (:ids) AND deletedAt IS NULL")
+    fun observeByIds(userId: String, ids: List<String>): Flow<List<TaskEntity>>
+
     @Query(
         """
         SELECT * FROM tasks
@@ -202,6 +205,9 @@ interface TaskDao {
     @Query("DELETE FROM tasks WHERE userId = :userId AND templateApplicationId = :applicationId")
     suspend fun hardDeleteForTemplateApplication(userId: String, applicationId: String)
 
+    @Query("UPDATE tasks SET deletedAt = :deletedAt, updatedAt = :deletedAt, syncStatus = 3 WHERE userId = :userId AND templateApplicationId = :applicationId AND deletedAt IS NULL")
+    suspend fun softDeleteForTemplateApplication(userId: String, applicationId: String, deletedAt: Long)
+
     @Query(
         """
         SELECT COUNT(*) FROM tasks
@@ -237,6 +243,29 @@ interface TaskDao {
         """
     )
     suspend fun hardDeleteGeneratedForRuleFromDate(userId: String, ruleId: String, originType: Int, cutoff: Long)
+
+    @Query(
+        """
+        UPDATE tasks SET deletedAt = :now, updatedAt = :now, syncStatus = 3
+        WHERE userId = :userId
+          AND recurrenceRuleId = :ruleId
+          AND originType = :originType
+          AND deletedAt IS NULL
+          AND date >= :cutoff
+        """
+    )
+    suspend fun softDeleteGeneratedForRuleFromDate(userId: String, ruleId: String, originType: Int, cutoff: Long, now: Long)
+
+    @Query(
+        """
+        UPDATE tasks
+        SET recurrenceRuleId = NULL, instanceDate = NULL,
+            updatedAt = :updatedAt, syncStatus = :syncStatus
+        WHERE userId = :userId AND recurrenceRuleId = :ruleId
+          AND deletedAt IS NULL AND date < :before
+        """
+    )
+    suspend fun detachFromRuleBefore(userId: String, ruleId: String, before: Long, updatedAt: Long, syncStatus: Int)
 
     @Query(
         """

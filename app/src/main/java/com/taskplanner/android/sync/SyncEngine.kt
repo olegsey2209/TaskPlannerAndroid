@@ -40,6 +40,13 @@ class SyncEngine(
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val syncing = AtomicBoolean(false)
+    private val pendingResumeUserIds = java.util.concurrent.CopyOnWriteArraySet<String>()
+    private val noopTrigger = SyncTrigger {}
+    private val recurrenceRepo by lazy {
+        com.taskplanner.android.data.repository.RecurrenceRepository(
+            db.recurrenceRuleDao(), db.taskDao(), noopTrigger
+        )
+    }
     @Volatile private var pendingSync: String? = null
 
     private val _isSyncing = MutableStateFlow(false)
@@ -137,6 +144,11 @@ class SyncEngine(
         uploadLocalChanges(userId)
         
         downloadRemoteChanges(userId)
+
+
+        if (pendingResumeUserIds.remove(userId)) {
+            recurrenceRepo.generateUpcomingTasksIfNeeded(userId)
+        }
     }
 
     private suspend fun performInitialSyncIfNeeded(userId: String): Boolean {
@@ -204,9 +216,11 @@ class SyncEngine(
             when (type) {
                 SyncEntityType.TASK -> {
                     val existing = db.taskDao().getByIdAny(userId, remoteId)
-                    
-                    if (existing != null && existing.syncStatus != syncedRaw) continue
                     val localUpdated = existing?.updatedAt ?: Long.MIN_VALUE
+
+                    if (existing != null && existing.syncStatus != syncedRaw && localUpdated >= remoteUpdated) continue
+
+                    if (existing?.deletedAt != null && existing.syncStatus != syncedRaw) continue
                     if (existing == null || remoteUpdated > localUpdated) {
                         TaskSyncMapper.fromFirestore(data, existing)?.let { task ->
                             db.taskDao().upsert(task)
@@ -222,7 +236,8 @@ class SyncEngine(
                     val existing = db.categoryDao().getByIdAny(userId, remoteId)
                         ?: SyncMapperHelpers.stringFromAny(data["name"])
                             ?.let { db.categoryDao().getByName(userId, it) }
-                    if (existing != null && existing.syncStatus != syncedRaw) continue
+                    val localUpd_category = existing?.updatedAt ?: Long.MIN_VALUE
+                    if (existing != null && existing.syncStatus != syncedRaw && localUpd_category >= remoteUpdated) continue
                     val localUpdated = existing?.updatedAt ?: Long.MIN_VALUE
                     if (existing == null || remoteUpdated > localUpdated) {
                         CategorySyncMapper.fromFirestore(data, existing)?.let { db.categoryDao().upsert(it) }
@@ -230,7 +245,8 @@ class SyncEngine(
                 }
                 SyncEntityType.GOAL -> {
                     val existing = db.goalDao().getByIdAny(userId, remoteId)
-                    if (existing != null && existing.syncStatus != syncedRaw) continue
+                    val localUpd_goal = existing?.updatedAt ?: Long.MIN_VALUE
+                    if (existing != null && existing.syncStatus != syncedRaw && localUpd_goal >= remoteUpdated) continue
                     val localUpdated = existing?.updatedAt ?: Long.MIN_VALUE
                     if (existing == null || remoteUpdated > localUpdated) {
                         GoalSyncMapper.fromFirestore(data, existing)?.let { db.goalDao().upsert(it) }
@@ -238,7 +254,8 @@ class SyncEngine(
                 }
                 SyncEntityType.GOAL_STEP -> {
                     val existing = db.goalStepDao().getByIdAny(userId, remoteId)
-                    if (existing != null && existing.syncStatus != syncedRaw) continue
+                    val localUpd_goal_step = existing?.updatedAt ?: Long.MIN_VALUE
+                    if (existing != null && existing.syncStatus != syncedRaw && localUpd_goal_step >= remoteUpdated) continue
                     val localUpdated = existing?.updatedAt ?: Long.MIN_VALUE
                     if (existing == null || remoteUpdated > localUpdated) {
                         GoalStepSyncMapper.fromFirestore(data, existing)?.let { db.goalStepDao().upsert(it) }
@@ -246,15 +263,51 @@ class SyncEngine(
                 }
                 SyncEntityType.RECURRENCE_RULE -> {
                     val existing = db.recurrenceRuleDao().getByIdAny(userId, remoteId)
-                    if (existing != null && existing.syncStatus != syncedRaw) continue
                     val localUpdated = existing?.updatedAt ?: Long.MIN_VALUE
-                    if (existing == null || remoteUpdated > localUpdated) {
-                        RecurrenceRuleSyncMapper.fromFirestore(data, existing)?.let { db.recurrenceRuleDao().upsert(it) }
+
+
+                    if (existing != null && existing.syncStatus != syncedRaw && localUpdated > remoteUpdated) continue
+
+
+                    val mapped = RecurrenceRuleSyncMapper.fromFirestore(data, existing)
+                    if (mapped != null && (
+                        existing == null ||
+                        remoteUpdated >= localUpdated ||
+                        mapped.endDate != existing.endDate ||
+                        mapped.deletedAt != existing.deletedAt
+                    )) {
+                        val now = System.currentTimeMillis()
+                        val today = com.taskplanner.android.core.util.TimeUtils.startOfDayMillis(java.time.LocalDate.now())
+
+                        when {
+                            mapped.deletedAt != null && (existing == null || existing.deletedAt == null) -> {
+                                db.recurrenceRuleDao().upsert(mapped)
+                                db.taskDao().softDeleteGeneratedForRuleFromDate(userId, remoteId, com.taskplanner.android.core.model.TaskOriginType.RECURRENCE.raw, today, now)
+                                db.taskDao().detachFromRuleBefore(userId, remoteId, today, now, 3)
+                            }
+                            mapped.deletedAt == null && mapped.endDate != null && mapped.endDate != existing?.endDate -> {
+
+                                val cutoff = mapped.endDate + com.taskplanner.android.data.repository.RecurrenceRepository.DAY_MILLIS
+                                db.taskDao().softDeleteGeneratedForRuleFromDate(userId, remoteId, com.taskplanner.android.core.model.TaskOriginType.RECURRENCE.raw, cutoff, now)
+                                db.recurrenceRuleDao().upsert(mapped.copy(lastGeneratedAt = mapped.endDate))
+                            }
+                            mapped.deletedAt == null && mapped.endDate == null && existing?.endDate != null -> {
+
+                                val generationStart = if (mapped.startDate > today) mapped.startDate else today
+                                val lastGen = generationStart - com.taskplanner.android.data.repository.RecurrenceRepository.DAY_MILLIS
+                                db.recurrenceRuleDao().upsert(mapped.copy(lastGeneratedAt = lastGen))
+                                pendingResumeUserIds.add(userId)
+                            }
+                            else -> {
+                                db.recurrenceRuleDao().upsert(mapped)
+                            }
+                        }
                     }
                 }
                 SyncEntityType.TEMPLATE -> {
                     val existing = db.scheduleTemplateDao().getByIdAny(userId, remoteId)
-                    if (existing != null && existing.syncStatus != syncedRaw) continue
+                    val localUpd_template = existing?.updatedAt ?: Long.MIN_VALUE
+                    if (existing != null && existing.syncStatus != syncedRaw && localUpd_template >= remoteUpdated) continue
                     val localUpdated = existing?.updatedAt ?: Long.MIN_VALUE
                     if (existing == null || remoteUpdated > localUpdated) {
                         ScheduleTemplateSyncMapper.fromFirestore(data, existing)?.let { db.scheduleTemplateDao().upsert(it) }
@@ -262,7 +315,8 @@ class SyncEngine(
                 }
                 SyncEntityType.TEMPLATE_ITEM -> {
                     val existing = db.scheduleTemplateItemDao().getByIdAny(userId, remoteId)
-                    if (existing != null && existing.syncStatus != syncedRaw) continue
+                    val localUpd_template_item = existing?.updatedAt ?: Long.MIN_VALUE
+                    if (existing != null && existing.syncStatus != syncedRaw && localUpd_template_item >= remoteUpdated) continue
                     val localUpdated = existing?.updatedAt ?: Long.MIN_VALUE
                     if (existing == null || remoteUpdated > localUpdated) {
                         ScheduleTemplateItemSyncMapper.fromFirestore(data, existing)?.let { db.scheduleTemplateItemDao().upsert(it) }
@@ -270,10 +324,24 @@ class SyncEngine(
                 }
                 SyncEntityType.TEMPLATE_APPLICATION -> {
                     val existing = db.templateApplicationDao().getByIdAny(userId, remoteId)
-                    if (existing != null && existing.syncStatus != syncedRaw) continue
+                    val localDeletedAt = existing?.deletedAt
                     val localUpdated = existing?.updatedAt ?: Long.MIN_VALUE
-                    if (existing == null || remoteUpdated > localUpdated) {
-                        TemplateApplicationSyncMapper.fromFirestore(data, existing)?.let { db.templateApplicationDao().upsert(it) }
+
+
+                    if (existing != null && existing.syncStatus != syncedRaw && localUpdated >= remoteUpdated) continue
+
+                    if (localDeletedAt != null) continue
+
+                    if (existing == null || remoteUpdated > localUpdated ||
+                        (existing.syncStatus == syncedRaw && remoteUpdated >= localUpdated)) {
+                        val mapped = TemplateApplicationSyncMapper.fromFirestore(data, existing)
+                        if (mapped != null) {
+                            db.templateApplicationDao().upsert(mapped)
+                            if (mapped.deletedAt != null && (existing == null || existing.deletedAt == null)) {
+                                val now = System.currentTimeMillis()
+                                db.taskDao().softDeleteForTemplateApplication(userId, remoteId, now)
+                            }
+                        }
                     }
                 }
                 SyncEntityType.USER_PROFILE -> {

@@ -11,6 +11,7 @@ import com.taskplanner.android.data.local.entities.TaskEntity
 import com.taskplanner.android.data.repository.CategoryRepository
 import com.taskplanner.android.data.repository.TaskRepository
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.SharingStarted
@@ -67,11 +68,18 @@ class TasksViewModel(
         }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
     
-    val calendarTasks: StateFlow<List<TaskEntity>> = _selectedDate
-        .flatMapLatest { date ->
-            taskRepository.observeTasksForMonth(userId, java.time.YearMonth.from(date))
+    private val _calendarMonth = MutableStateFlow(java.time.YearMonth.now())
+    val calendarMonth: StateFlow<java.time.YearMonth> = _calendarMonth.asStateFlow()
+
+    val calendarTasks: StateFlow<List<TaskEntity>> = _calendarMonth
+        .flatMapLatest { month ->
+            taskRepository.observeTasksForMonth(userId, month)
         }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    fun setCalendarMonth(month: java.time.YearMonth) {
+        _calendarMonth.value = month
+    }
 
     
     val searchQuery = MutableStateFlow("")

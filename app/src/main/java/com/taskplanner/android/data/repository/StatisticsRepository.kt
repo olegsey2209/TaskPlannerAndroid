@@ -8,6 +8,7 @@ import com.taskplanner.android.data.local.dao.GoalDao
 import com.taskplanner.android.data.local.dao.TaskDao
 import java.time.DayOfWeek
 import java.time.LocalDate
+import java.time.LocalTime
 import java.time.temporal.TemporalAdjusters
 
 enum class StatisticsPeriod {
@@ -27,6 +28,7 @@ data class StatisticsData(
     val tasksByPriority: Map<Int, Int> = emptyMap(),
     val tasksByCategory: Map<String, Int> = emptyMap(),
     val dailyCompletion: Map<LocalDate, Int> = emptyMap(),
+    val hourlyCompletion: Map<Int, Int>? = null,
     val goalProgress: List<Pair<String, Double>> = emptyList()
 )
 
@@ -80,6 +82,18 @@ class StatisticsRepository(
             cursor = cursor.plusDays(1)
         }
 
+        val hourlyCompletion = if (period == StatisticsPeriod.DAY) {
+            val dayStart = TimeUtils.startOfDayMillis(startDate)
+            (0..23).associateWith { hour ->
+                val hourStart = dayStart + hour * 3_600_000L
+                val hourEnd = hourStart + 3_600_000L
+                tasks.count { t ->
+                    t.status == TaskStatus.COMPLETED.raw &&
+                    (t.completedAt ?: t.date).let { ts -> ts >= hourStart && ts < hourEnd }
+                }
+            }
+        } else null
+
         val goals = goalDao.getAll(userId)
         val totalGoals = goals.size
         val completedGoals = goals.count { it.status == GoalStatus.COMPLETED.raw }
@@ -90,6 +104,7 @@ class StatisticsRepository(
         return StatisticsData(
             totalTasks = totalTasks,
             completedTasks = completedTasks,
+            hourlyCompletion = hourlyCompletion,
             completionRate = completionRate,
             totalGoals = totalGoals,
             completedGoals = completedGoals,

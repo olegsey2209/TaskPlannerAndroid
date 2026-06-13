@@ -259,10 +259,12 @@ fun ScheduleScreen(padding: PaddingValues, userId: String) {
 
     showApplyTemplate?.let { template ->
         val items = vm.observeTemplateItems(template.id).collectAsState(initial = emptyList()).value
+        val existingApps = vm.observeTemplateApplications(template.id).collectAsState(initial = emptyList()).value
         ApplyTemplateBottomSheet(
             template = template,
             items = items,
             categories = categories,
+            existingApplications = existingApps,
             onDismiss = { showApplyTemplate = null },
             onApply = { start, end, onApplied ->
                 vm.applyTemplate(template.id, start, end) { applicationId ->
@@ -1228,9 +1230,11 @@ private fun RecurrenceEditorBottomSheet(
     var frequencyMenu by remember { mutableStateOf(false) }
 
     LaunchedEffect(Unit) {
-        
-        val wd = startDate.dayOfWeek.value
-        if (!selectedWeekdays.contains(wd)) selectedWeekdays.add(wd)
+        // Добавляем день недели только при СОЗДАНИИ нового правила
+        if (existing == null) {
+            val wd = startDate.dayOfWeek.value
+            if (!selectedWeekdays.contains(wd)) selectedWeekdays.add(wd)
+        }
     }
 
     val canSave = title.trim().isNotEmpty() && (frequency != com.taskplanner.android.core.model.RecurrenceFrequency.WEEKLY || selectedWeekdays.isNotEmpty())
@@ -1365,7 +1369,7 @@ private fun RecurrenceEditorBottomSheet(
                                 listOf(com.taskplanner.android.core.model.RecurrenceFrequency.DAILY, com.taskplanner.android.core.model.RecurrenceFrequency.WEEKLY, com.taskplanner.android.core.model.RecurrenceFrequency.MONTHLY, com.taskplanner.android.core.model.RecurrenceFrequency.YEARLY).forEach { f ->
                                     IosMenuItem(frequencyTitle(f), Icons.Filled.Repeat, if (frequency == f) AppColors.Blue else AppColors.Label) {
                                         frequency = f; frequencyMenu = false
-                                        if (f == com.taskplanner.android.core.model.RecurrenceFrequency.WEEKLY && selectedWeekdays.isEmpty()) selectedWeekdays.add(startDate.dayOfWeek.value)
+                                        if (f == com.taskplanner.android.core.model.RecurrenceFrequency.WEEKLY && selectedWeekdays.isEmpty() && existing == null) selectedWeekdays.add(startDate.dayOfWeek.value)
                                     }
                                 }
                             }
@@ -1422,7 +1426,7 @@ private fun RecurrenceEditorBottomSheet(
             onSelected = {
                 startDate = it
                 if (endDate.isBefore(startDate)) endDate = startDate
-                if (frequency == com.taskplanner.android.core.model.RecurrenceFrequency.WEEKLY && selectedWeekdays.isEmpty()) {
+                if (frequency == com.taskplanner.android.core.model.RecurrenceFrequency.WEEKLY && selectedWeekdays.isEmpty() && existing == null) {
                     selectedWeekdays.add(startDate.dayOfWeek.value)
                 }
                 pickingStart = false
@@ -1533,6 +1537,7 @@ private fun ApplyTemplateBottomSheet(
     template: ScheduleTemplateEntity,
     items: List<ScheduleTemplateItemEntity>,
     categories: List<CategoryEntity>,
+    existingApplications: List<com.taskplanner.android.data.local.entities.TemplateApplicationEntity>,
     onDismiss: () -> Unit,
     onApply: (start: LocalDate, end: LocalDate, onApplied: (applicationId: String?) -> Unit) -> Unit,
     onUndo: (applicationId: String) -> Unit
@@ -1543,6 +1548,19 @@ private fun ApplyTemplateBottomSheet(
     var pickingStart by remember { mutableStateOf(false) }
     var pickingEnd by remember { mutableStateOf(false) }
     var appliedApplicationId by remember(template.id) { mutableStateOf<String?>(null) }
+    var showOverlapWarning by remember { mutableStateOf(false) }
+    var pendingApplyStart by remember { mutableStateOf<java.time.LocalDate?>(null) }
+    var pendingApplyEnd by remember { mutableStateOf<java.time.LocalDate?>(null) }
+
+    fun hasOverlap(start: LocalDate, end: LocalDate): Boolean {
+        val startMs = com.taskplanner.android.core.util.TimeUtils.startOfDayMillis(start)
+        val endMs = com.taskplanner.android.core.util.TimeUtils.startOfDayMillis(end)
+        return existingApplications.any { app ->
+            app.deletedAt == null &&
+            app.startDate <= endMs &&
+            app.endDate >= startMs
+        }
+    }
 
     ModalBottomSheet(
         onDismissRequest = onDismiss,
@@ -1558,8 +1576,14 @@ private fun ApplyTemplateBottomSheet(
                 confirmEnabled = appliedApplicationId == null && !endDate.isBefore(startDate) && items.isNotEmpty(),
                 onCancel = onDismiss,
                 onConfirm = {
-                    onApply(startDate, endDate) { id ->
-                        appliedApplicationId = id
+                    if (hasOverlap(startDate, endDate)) {
+                        pendingApplyStart = startDate
+                        pendingApplyEnd = endDate
+                        showOverlapWarning = true
+                    } else {
+                        onApply(startDate, endDate) { id ->
+                            appliedApplicationId = id
+                        }
                     }
                 }
             )
@@ -1644,21 +1668,7 @@ private fun ApplyTemplateBottomSheet(
                     }
                 }
 
-                if (appliedApplicationId != null) {
-                    TextButton(
-                        onClick = {
-                            val id = appliedApplicationId ?: return@TextButton
-                            onUndo(id)
-                            appliedApplicationId = null
-                            onDismiss()
-                        },
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Icon(Icons.Filled.Delete, contentDescription = null, tint = MaterialTheme.colorScheme.error)
-                        Spacer(Modifier.width(8.dp))
-                        Text("Отменить применение шаблона", color = MaterialTheme.colorScheme.error)
-                    }
-                }
+                // Кнопка отмены применения убрана
             }
         }
     }
@@ -1682,6 +1692,25 @@ private fun ApplyTemplateBottomSheet(
                 endDate = it
                 if (endDate.isBefore(startDate)) startDate = endDate
                 pickingEnd = false
+            }
+        )
+    }
+
+    if (showOverlapWarning) {
+        androidx.compose.material3.AlertDialog(
+            onDismissRequest = { showOverlapWarning = false },
+            title = { Text("Шаблон уже применён") },
+            text = { Text("На этот период уже были созданы задачи по этому шаблону. Создать задачи ещё раз?") },
+            confirmButton = {
+                TextButton(onClick = {
+                    showOverlapWarning = false
+                    val s = pendingApplyStart ?: return@TextButton
+                    val e = pendingApplyEnd ?: return@TextButton
+                    onApply(s, e) { id -> appliedApplicationId = id }
+                }) { Text("Создать снова") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showOverlapWarning = false }) { Text("Отмена") }
             }
         )
     }

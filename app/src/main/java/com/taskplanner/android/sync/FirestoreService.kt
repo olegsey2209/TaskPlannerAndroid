@@ -42,7 +42,7 @@ class FirestoreService {
             val batch = db.batch()
             for (op in slice) {
                 val ref = collection(userId, op.type).document(op.documentId)
-                
+
                 batch.set(ref, op.data, com.google.firebase.firestore.SetOptions.merge())
             }
             batch.commit().await()

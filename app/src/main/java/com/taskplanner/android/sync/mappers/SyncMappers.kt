@@ -169,7 +169,7 @@ object CategorySyncMapper {
             id = id,
             userId = userId,
             name = SyncMapperHelpers.stringFromAny(data["name"]) ?: existing?.name ?: "",
-            iconName = SyncMapperHelpers.stringFromAny(data["iconName"]) ?: existing?.iconName ?: "tag",
+            iconName = SyncMapperHelpers.stringFromAny(data["iconName"])?.takeIf { it.isNotBlank() } ?: existing?.iconName ?: "tag.fill",
             colorHex = SyncMapperHelpers.stringFromAny(data["colorHex"]) ?: existing?.colorHex ?: "#007AFF",
             sortOrder = SyncMapperHelpers.intFromAny(data["sortOrder"]) ?: existing?.sortOrder ?: 0,
             isArchived = SyncMapperHelpers.boolFromAny(data["isArchived"]) ?: existing?.isArchived ?: false,
