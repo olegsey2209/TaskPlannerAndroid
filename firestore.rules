@@ -1,0 +1,16 @@
+// Правила доступа к Firestore. Нужно скопировать в:
+// Firebase Console → Firestore Database → Rules → опубликовать.
+//
+// Дают доступ читать/писать только в свою папку users/{твой uid}/...
+// Это совпадает с тем, как iOS и Android приложения структурируют данные.
+
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Юзер видит и пишет только под собственный uid.
+    match /users/{userId}/{document=**} {
+      allow read, write: if request.auth != null
+                         && request.auth.uid == userId;
+    }
+  }
+}
