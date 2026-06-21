@@ -3,6 +3,7 @@ package com.taskplanner.android.data.repository
 import com.taskplanner.android.core.model.SyncStatus
 import com.taskplanner.android.core.model.TaskOriginType
 import com.taskplanner.android.core.model.TaskStatus
+import com.taskplanner.android.core.util.AppLimits
 import com.taskplanner.android.core.util.TimeUtils
 import com.taskplanner.android.data.local.dao.ScheduleTemplateDao
 import com.taskplanner.android.data.local.dao.ScheduleTemplateItemDao
@@ -197,16 +198,18 @@ class TemplateRepository(
         applicationDao.upsert(application)
 
         var current = startDate
+        val datesNeedingTimeSort = mutableSetOf<LocalDate>()
         while (!current.isAfter(endDate)) {
             val weekday = current.dayOfWeek.toWeekdayNumber()
             val dayItems = items.filter { it.weekday == weekday }
             val dayMillis = TimeUtils.startOfDayMillis(current)
             val endMillis = TimeUtils.startOfDayMillis(current.plusDays(1))
+            var dayTaskCount = taskDao.countTopLevelForDay(userId, dayMillis, endMillis)
             for (item in dayItems) {
+                if (dayTaskCount >= AppLimits.MAX_TASKS_PER_DAY) break
 
-
-                val minPos = taskDao.getMinPositionForDay(userId, dayMillis, endMillis) ?: 0
-                val position = minPos - 1
+                val maxPos = taskDao.getMaxPositionForDay(userId, dayMillis, endMillis) ?: -1
+                val position = maxPos + 1
 
                 val taskStartTimeMillis = item.startTime?.let { stored ->
                     val localTime = TimeUtils.localTimeFromMillis(stored)
@@ -243,13 +246,55 @@ class TemplateRepository(
                     syncStatus = SyncStatus.CREATED_LOCAL.raw
                 )
                 taskDao.upsert(task)
+                dayTaskCount += 1
+                if (taskStartTimeMillis != null) {
+                    datesNeedingTimeSort += current
+                }
             }
 
             current = current.plusDays(1)
         }
 
+        datesNeedingTimeSort.forEach { date ->
+            sortTasksByTime(userId, date)
+        }
+
         syncTrigger.trigger()
         return application.id
+    }
+
+    private suspend fun sortTasksByTime(userId: String, date: LocalDate) {
+        val start = TimeUtils.startOfDayMillis(date)
+        val end = TimeUtils.startOfDayMillis(date.plusDays(1))
+        val now = System.currentTimeMillis()
+
+        taskDao.getTopLevelForDay(userId, start, end)
+            .sortedWith(
+                compareBy<TaskEntity> { timeSortKey(it) ?: Int.MAX_VALUE }
+                    .thenBy { it.position }
+                    .thenByDescending { it.createdAt }
+                    .thenBy { it.id }
+            )
+            .forEachIndexed { index, task ->
+                if (task.position == index) return@forEachIndexed
+                taskDao.upsert(
+                    task.copy(
+                        position = index,
+                        updatedAt = now,
+                        syncStatus = localUpdateStatus(task.syncStatus)
+                    )
+                )
+            }
+    }
+
+    private fun timeSortKey(task: TaskEntity): Int? {
+        val millis = task.startTime ?: return null
+        val time = TimeUtils.localTimeFromMillis(millis)
+        return time.hour * 60 + time.minute
+    }
+
+    private fun localUpdateStatus(current: Int): Int {
+        return if (current == SyncStatus.SYNCED.raw) SyncStatus.UPDATED_LOCAL.raw else current
     }
 
     suspend fun deleteTemplateApplication(userId: String, applicationId: String) {
@@ -266,6 +311,10 @@ class TemplateRepository(
 
     suspend fun countTasksForApplication(userId: String, applicationId: String): Int {
         return taskDao.countForTemplateApplication(userId, applicationId)
+    }
+
+    fun observeTasksForApplication(userId: String, applicationId: String): Flow<List<TaskEntity>> {
+        return taskDao.observeForTemplateApplication(userId, applicationId)
     }
 }
 

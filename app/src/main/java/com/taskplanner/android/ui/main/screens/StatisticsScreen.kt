@@ -28,6 +28,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
@@ -57,12 +58,23 @@ import kotlin.math.roundToInt
 fun StatisticsScreen(padding: PaddingValues, userId: String) {
     val graph = LocalAppGraph.current
     val vm: StatisticsViewModel = viewModel(
+        key = "statistics-$userId",
         factory = StatisticsViewModel.Factory(userId, graph.statisticsRepository)
     )
 
     val loading by vm.loading.collectAsState()
     val data by vm.data.collectAsState()
     val period by vm.selectedPeriod.collectAsState()
+    val isSyncing by graph.syncEngine.isSyncing.collectAsState()
+
+    LaunchedEffect(Unit) {
+        vm.refresh()
+    }
+    LaunchedEffect(isSyncing) {
+        if (!isSyncing) {
+            vm.refresh()
+        }
+    }
 
     LazyColumn(
         modifier = Modifier

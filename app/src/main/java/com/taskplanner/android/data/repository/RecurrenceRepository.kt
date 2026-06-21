@@ -4,6 +4,7 @@ import com.taskplanner.android.core.model.RecurrenceFrequency
 import com.taskplanner.android.core.model.SyncStatus
 import com.taskplanner.android.core.model.TaskOriginType
 import com.taskplanner.android.core.model.TaskStatus
+import com.taskplanner.android.core.util.AppLimits
 import com.taskplanner.android.core.util.TimeUtils
 import com.taskplanner.android.data.local.dao.RecurrenceRuleDao
 import com.taskplanner.android.data.local.dao.TaskDao
@@ -264,26 +265,61 @@ class RecurrenceRepository(
         val now = System.currentTimeMillis()
         val today = TimeUtils.startOfDayMillis(LocalDate.now())
         val tomorrow = TimeUtils.startOfDayMillis(LocalDate.now().plusDays(1))
+        val sourceTask = taskDao.getByIdAny(userId, rule.sourceTaskId)
+        val sourceHasGeneratedOccurrence = sourceTask?.let { source ->
+            val sourceDate = TimeUtils.localDateFromMillis(source.date)
+            val sourceDay = TimeUtils.startOfDayMillis(sourceDate)
+            val sourceDayEnd = TimeUtils.startOfDayMillis(sourceDate.plusDays(1))
+            taskDao.getForRange(userId, sourceDay, sourceDayEnd).any {
+                it.recurrenceRuleId == ruleId &&
+                    it.originType == TaskOriginType.RECURRENCE.raw &&
+                    it.deletedAt == null
+            }
+        } ?: false
 
+        taskDao.restoreGeneratedTaskForDay(
+            userId = userId,
+            ruleId = ruleId,
+            recurrenceOriginType = TaskOriginType.RECURRENCE.raw,
+            manualOriginType = TaskOriginType.MANUAL.raw,
+            startInclusive = today,
+            endExclusive = tomorrow,
+            updatedAt = now,
+            syncStatus = SyncStatus.UPDATED_LOCAL.raw
+        )
 
         taskDao.softDeleteGeneratedForRuleFromDate(userId, ruleId, TaskOriginType.RECURRENCE.raw, tomorrow, now)
 
 
-        taskDao.softDeleteGeneratedForRuleFromDate(userId, ruleId, TaskOriginType.RECURRENCE.raw, today, now)
+        taskDao.detachFromRuleBefore(
+            userId = userId,
+            ruleId = ruleId,
+            before = tomorrow,
+            manualOriginType = TaskOriginType.MANUAL.raw,
+            updatedAt = now,
+            syncStatus = SyncStatus.UPDATED_LOCAL.raw
+        )
 
-
-        taskDao.detachFromRuleBefore(userId, ruleId, today, now, SyncStatus.UPDATED_LOCAL.raw)
-
-
-        val sourceTask = taskDao.getByIdAny(userId, rule.sourceTaskId)
         if (sourceTask != null) {
-            taskDao.upsert(sourceTask.copy(
-                recurrenceRuleId = null,
-                instanceDate = null,
-                originType = com.taskplanner.android.core.model.TaskOriginType.MANUAL.raw,
-                updatedAt = now,
-                syncStatus = SyncStatus.UPDATED_LOCAL.raw
-            ))
+            if (sourceHasGeneratedOccurrence) {
+                taskDao.softDelete(
+                    userId = userId,
+                    id = sourceTask.id,
+                    deletedAt = now,
+                    updatedAt = now,
+                    syncStatus = SyncStatus.DELETED_LOCAL.raw
+                )
+            } else {
+                taskDao.upsert(
+                    sourceTask.copy(
+                        recurrenceRuleId = null,
+                        instanceDate = null,
+                        originType = TaskOriginType.MANUAL.raw,
+                        updatedAt = now,
+                        syncStatus = SyncStatus.UPDATED_LOCAL.raw
+                    )
+                )
+            }
         }
 
         ruleDao.update(rule.copy(deletedAt = now, updatedAt = now, syncStatus = SyncStatus.DELETED_LOCAL.raw))
@@ -378,6 +414,7 @@ class RecurrenceRepository(
 
         var current = generationStartCandidate
         val effectiveHasReminder = sourceTask.hasReminder && sourceTask.startTime != null
+        val datesNeedingTimeSort = mutableSetOf<LocalDate>()
         while (!current.isAfter(generateUntilDate)) {
             if (shouldGenerate(rule, startDate, current)) {
                 val dayMillis = TimeUtils.startOfDayMillis(current)
@@ -386,11 +423,15 @@ class RecurrenceRepository(
                     t.recurrenceRuleId == rule.id &&
                         t.originType == TaskOriginType.RECURRENCE.raw &&
                         t.date == dayMillis &&
-                        t.deletedAt == null
+                    t.deletedAt == null
                 }
                 if (!exists) {
-                    val minPos = taskDao.getMinPositionForDay(userId, dayMillis, endMillis) ?: 0
-                    val position = minPos - 1
+                    if (taskDao.countTopLevelForDay(userId, dayMillis, endMillis) >= AppLimits.MAX_TASKS_PER_DAY) {
+                        current = current.plusDays(1)
+                        continue
+                    }
+                    val maxPos = taskDao.getMaxPositionForDay(userId, dayMillis, endMillis) ?: -1
+                    val position = maxPos + 1
 
                     val startTimeMillis = sourceTask.startTime?.let { stored ->
                         val localTime = TimeUtils.localTimeFromMillis(stored)
@@ -428,9 +469,16 @@ class RecurrenceRepository(
                         syncStatus = SyncStatus.CREATED_LOCAL.raw
                     )
                     taskDao.upsert(task)
+                    if (startTimeMillis != null) {
+                        datesNeedingTimeSort += current
+                    }
                 }
             }
             current = current.plusDays(1)
+        }
+
+        datesNeedingTimeSort.forEach { date ->
+            sortTasksByTime(userId, date)
         }
 
         val newLastGenerated = if (!generationStartCandidate.isAfter(generateUntilDate)) {
@@ -441,6 +489,46 @@ class RecurrenceRepository(
 
         val now = System.currentTimeMillis()
         ruleDao.update(rule.copy(lastGeneratedAt = newLastGenerated, updatedAt = now, syncStatus = SyncStatus.UPDATED_LOCAL.raw))
+    }
+
+    private suspend fun sortTasksByTime(userId: String, date: LocalDate) {
+        val start = TimeUtils.startOfDayMillis(date)
+        val end = TimeUtils.startOfDayMillis(date.plusDays(1))
+        val now = System.currentTimeMillis()
+        val sourceIds = ruleDao.getAllForUser(userId)
+            .filter { it.deletedAt == null }
+            .map { it.sourceTaskId }
+            .filter { it.isNotBlank() }
+            .toSet()
+
+        taskDao.getTopLevelForDay(userId, start, end)
+            .filterNot { it.id in sourceIds }
+            .sortedWith(
+                compareBy<TaskEntity> { timeSortKey(it) ?: Int.MAX_VALUE }
+                    .thenBy { it.position }
+                    .thenByDescending { it.createdAt }
+                    .thenBy { it.id }
+            )
+            .forEachIndexed { index, task ->
+                if (task.position == index) return@forEachIndexed
+                taskDao.upsert(
+                    task.copy(
+                        position = index,
+                        updatedAt = now,
+                        syncStatus = localUpdateStatus(task.syncStatus)
+                    )
+                )
+            }
+    }
+
+    private fun timeSortKey(task: TaskEntity): Int? {
+        val millis = task.startTime ?: return null
+        val time = TimeUtils.localTimeFromMillis(millis)
+        return time.hour * 60 + time.minute
+    }
+
+    private fun localUpdateStatus(current: Int): Int {
+        return if (current == SyncStatus.SYNCED.raw) SyncStatus.UPDATED_LOCAL.raw else current
     }
 
     private fun shouldGenerate(rule: RecurrenceRuleEntity, seriesStart: LocalDate, date: LocalDate): Boolean {

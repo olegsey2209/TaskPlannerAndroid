@@ -35,6 +35,7 @@ import com.taskplanner.android.ui.theme.AppColors
 fun CategoriesScreen(userId: String, onBack: () -> Unit) {
     val graph = LocalAppGraph.current
     val vm: CategoriesViewModel = viewModel(
+        key = "categories-$userId",
         factory = CategoriesViewModel.Factory(userId, graph.categoryRepository)
     )
     val categories by vm.categories.collectAsState()
@@ -129,14 +130,16 @@ fun CategoriesScreen(userId: String, onBack: () -> Unit) {
     pendingDelete?.let { cat ->
         AlertDialog(
             onDismissRequest = { pendingDelete = null },
-            title = { Text("Удалить категорию?") },
-            text = { Text("Категория «${cat.name}» будет удалена.") },
+            containerColor = Color.White,
+            shape = RoundedCornerShape(24.dp),
+            title = { Text("Удалить категорию?", fontWeight = FontWeight.SemiBold, color = AppColors.Label) },
+            text = { Text("Категория «${cat.name}» будет удалена.", color = AppColors.GrayText) },
             confirmButton = {
                 TextButton(onClick = { vm.deleteCategory(cat.id); pendingDelete = null }) {
-                    Text("Удалить", color = AppColors.Red)
+                    Text("Удалить", color = AppColors.Red, fontWeight = FontWeight.SemiBold)
                 }
             },
-            dismissButton = { TextButton(onClick = { pendingDelete = null }) { Text("Отмена") } }
+            dismissButton = { TextButton(onClick = { pendingDelete = null }) { Text("Отмена", color = AppColors.Blue) } }
         )
     }
 }
@@ -185,7 +188,7 @@ private fun CatRow(category: CategoryEntity, onEdit: () -> Unit, onDelete: () ->
 private fun CategoryEditorDialogCat(initial: CategoryEntity?, onDismiss: () -> Unit, onSave: (String, String, String) -> Unit) {
     var name by remember { mutableStateOf(initial?.name ?: "") }
     var selectedColor by remember { mutableStateOf(initial?.colorHex ?: "#007AFF") }
-    var selectedIcon by remember { mutableStateOf(initial?.iconName ?: "tag") }
+    var selectedIcon by remember { mutableStateOf(initial?.iconName ?: "tag.fill") }
     val palette = listOf("#007AFF","#34C759","#FF9500","#FF3B30","#AF52DE","#FF2D55","#64D2FF","#5856D6","#FF6900","#A1887F")
     
     val icons = listOf(
@@ -193,9 +196,9 @@ private fun CategoryEditorDialogCat(initial: CategoryEntity?, onDismiss: () -> U
         "person.fill" to Icons.Filled.Person,
         "briefcase.fill" to Icons.Filled.Work,
         "house.fill" to Icons.Filled.Home,
-        "book.fill" to Icons.Filled.School,
+        "book.fill" to Icons.Filled.MenuBook,
         "heart.fill" to Icons.Filled.Favorite,
-        "figure.run" to Icons.Filled.FitnessCenter,
+        "figure.run" to Icons.Filled.DirectionsRun,
         "paintpalette.fill" to Icons.Filled.Palette,
         "cart.fill" to Icons.Filled.ShoppingCart,
         "car.fill" to Icons.Filled.DirectionsCar,
@@ -204,49 +207,105 @@ private fun CategoryEditorDialogCat(initial: CategoryEntity?, onDismiss: () -> U
     )
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text(if (initial == null) "Новая категория" else "Изменить категорию") },
+        containerColor = Color.White,
+        shape = RoundedCornerShape(24.dp),
+        title = {
+            Text(
+                if (initial == null) "Новая категория" else "Изменить категорию",
+                fontSize = 20.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = AppColors.Label,
+                modifier = Modifier.fillMaxWidth(),
+                textAlign = androidx.compose.ui.text.style.TextAlign.Center
+            )
+        },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.verticalScroll(rememberScrollState())) {
-                OutlinedTextField(value = name, onValueChange = { name = it }, label = { Text("Название") }, singleLine = true, modifier = Modifier.fillMaxWidth())
-                Text("Цвет", fontSize = 13.sp, color = AppColors.GrayText)
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    palette.take(5).forEach { hex ->
-                        Box(modifier = Modifier.size(36.dp).clip(CircleShape).background(parseCatHex(hex)).clickable { selectedColor = hex },
-                            contentAlignment = Alignment.Center) {
-                            if (hex.equals(selectedColor, true)) Icon(Icons.Filled.CheckCircle, null, tint = Color.White, modifier = Modifier.size(20.dp))
-                        }
-                    }
+            Column(
+                verticalArrangement = Arrangement.spacedBy(16.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState())
+            ) {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("Название", fontSize = 12.sp, color = AppColors.GrayText, fontWeight = FontWeight.Medium)
+                    OutlinedTextField(
+                        value = name,
+                        onValueChange = { name = it },
+                        placeholder = { Text("Название категории", color = AppColors.GrayText) },
+                        singleLine = true,
+                        shape = RoundedCornerShape(14.dp),
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedContainerColor = AppColors.SecondarySystemBackground,
+                            unfocusedContainerColor = AppColors.SecondarySystemBackground,
+                            focusedBorderColor = AppColors.Blue,
+                            unfocusedBorderColor = Color.Transparent,
+                            cursorColor = AppColors.Blue
+                        ),
+                        modifier = Modifier.fillMaxWidth()
+                    )
                 }
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    palette.drop(5).forEach { hex ->
-                        Box(modifier = Modifier.size(36.dp).clip(CircleShape).background(parseCatHex(hex)).clickable { selectedColor = hex },
-                            contentAlignment = Alignment.Center) {
-                            if (hex.equals(selectedColor, true)) Icon(Icons.Filled.CheckCircle, null, tint = Color.White, modifier = Modifier.size(20.dp))
-                        }
-                    }
-                }
-                Text("Иконка", fontSize = 13.sp, color = AppColors.GrayText)
-                
-                icons.chunked(4).forEach { rowIcons ->
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        rowIcons.forEach { (name, vec) ->
-                            val catColor = parseCatHex(selectedColor)
-                            Box(modifier = Modifier.size(48.dp).clip(RoundedCornerShape(12.dp))
-                                .background(if (name == selectedIcon) catColor.copy(alpha = 0.18f) else Color(0xFFF2F2F7))
-                                .border(androidx.compose.foundation.BorderStroke(if (name == selectedIcon) 2.dp else 0.dp, if (name == selectedIcon) catColor else Color.Transparent), RoundedCornerShape(12.dp))
-                                .clickable { selectedIcon = name },
-                                contentAlignment = Alignment.Center) {
-                                Icon(vec, null, tint = if (name == selectedIcon) catColor else AppColors.Label, modifier = Modifier.size(24.dp))
+
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text("Цвет", fontSize = 12.sp, color = AppColors.GrayText, fontWeight = FontWeight.Medium)
+                    palette.chunked(5).forEach { rowColors ->
+                        Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
+                            rowColors.forEach { hex ->
+                                Box(
+                                    modifier = Modifier
+                                        .size(42.dp)
+                                        .clip(CircleShape)
+                                        .background(parseCatHex(hex))
+                                        .border(
+                                            BorderStroke(2.dp, if (hex.equals(selectedColor, true)) AppColors.Label.copy(alpha = 0.18f) else Color.Transparent),
+                                            CircleShape
+                                        )
+                                        .clickable { selectedColor = hex },
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    if (hex.equals(selectedColor, true)) {
+                                        Icon(Icons.Filled.Check, null, tint = Color.White, modifier = Modifier.size(20.dp))
+                                    }
+                                }
                             }
                         }
-                        
-                        repeat(4 - rowIcons.size) { Spacer(Modifier.size(48.dp)) }
+                    }
+                }
+
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text("Иконка", fontSize = 12.sp, color = AppColors.GrayText, fontWeight = FontWeight.Medium)
+                    icons.chunked(4).forEach { rowIcons ->
+                        Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
+                            rowIcons.forEach { (iconName, vec) ->
+                                val catColor = parseCatHex(selectedColor)
+                                val selected = iconName == selectedIcon
+                                Box(
+                                    modifier = Modifier
+                                        .size(50.dp)
+                                        .clip(RoundedCornerShape(14.dp))
+                                        .background(if (selected) catColor.copy(alpha = 0.15f) else AppColors.SecondarySystemBackground)
+                                        .border(BorderStroke(if (selected) 1.5.dp else 0.5.dp, if (selected) catColor else AppColors.SeparatorLight), RoundedCornerShape(14.dp))
+                                        .clickable { selectedIcon = iconName },
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Icon(vec, null, tint = if (selected) catColor else AppColors.Label, modifier = Modifier.size(24.dp))
+                                }
+                            }
+
+                            repeat(4 - rowIcons.size) { Spacer(Modifier.size(50.dp)) }
+                        }
                     }
                 }
             }
         },
-        confirmButton = { TextButton(onClick = { val t = name.trim(); if (t.isNotEmpty()) onSave(t, selectedIcon, selectedColor) }) { Text("Сохранить") } },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Отмена") } }
+        confirmButton = {
+            TextButton(
+                onClick = { val t = name.trim(); if (t.isNotEmpty()) onSave(t, selectedIcon, selectedColor) },
+                enabled = name.trim().isNotEmpty()
+            ) {
+                Text("Сохранить", color = if (name.trim().isNotEmpty()) AppColors.Blue else AppColors.GrayText, fontWeight = FontWeight.SemiBold)
+            }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Отмена", color = AppColors.Blue) } }
     )
 }
 
@@ -263,9 +322,9 @@ private val SF_TO_MATERIAL: Map<String, androidx.compose.ui.graphics.vector.Imag
     "person.fill" to Icons.Filled.Person,
     "briefcase.fill" to Icons.Filled.Work,
     "house.fill" to Icons.Filled.Home,
-    "book.fill" to Icons.Filled.School,
+    "book.fill" to Icons.Filled.MenuBook,
     "heart.fill" to Icons.Filled.Favorite,
-    "figure.run" to Icons.Filled.FitnessCenter,
+    "figure.run" to Icons.Filled.DirectionsRun,
     "paintpalette.fill" to Icons.Filled.Palette,
     "cart.fill" to Icons.Filled.ShoppingCart,
     "car.fill" to Icons.Filled.DirectionsCar,

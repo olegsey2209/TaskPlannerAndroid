@@ -190,14 +190,13 @@ private fun LoginScreen(onGoToRegister: () -> Unit) {
                             val uid = user.uid
                             android.util.Log.d("TaskPlanner", "Login: got uid=$uid, persisting locally")
                             try {
-                                graph.userRepository.getOrCreateUser(uid = uid, email = user.email ?: emailTrim)
+                                graph.userRepository.getOrCreateUser(
+                                    uid = uid,
+                                    email = user.email ?: emailTrim,
+                                    username = user.displayName
+                                )
                             } catch (t: Throwable) {
                                 android.util.Log.e("TaskPlanner", "Login: getOrCreateUser не удалось", t)
-                            }
-                            try {
-                                graph.categoryRepository.seedDefaultCategoriesIfEmpty(uid)
-                            } catch (t: Throwable) {
-                                android.util.Log.e("TaskPlanner", "Login: seed categories не удалось", t)
                             }
                             graph.setCurrentUserIdForTrigger(uid)
                             graph.userPrefs.setCurrentUserId(uid)
@@ -427,6 +426,14 @@ private fun RegisterScreen(onBackToLogin: () -> Unit) {
                             }
                             val uid = user.uid
                             android.util.Log.d("TaskPlanner", "Register: uid=$uid, persisting locally")
+                            runCatching {
+                                val profileUpdates = com.google.firebase.auth.UserProfileChangeRequest.Builder()
+                                    .setDisplayName(usernameTrim)
+                                    .build()
+                                user.updateProfile(profileUpdates).await()
+                            }.onFailure {
+                                android.util.Log.w("TaskPlanner", "Register: displayName не удалось сохранить", it)
+                            }
                             try {
                                 graph.userRepository.getOrCreateUser(
                                     uid = uid,
@@ -644,15 +651,23 @@ private fun mapAuthError(raw: String): String {
             "invalid login credentials" in lower || "invalid password" in lower ->
             "Неверный email или пароль"
         "no user record" in lower || "user-not-found" in lower ->
-            "Пользователь не найден"
+            "Аккаунт с такой почтой не найден. Проверьте email или зарегистрируйтесь."
         "email address is already" in lower || "email-already-in-use" in lower ->
-            "Этот email уже используется"
+            "Этот email уже используется. Попробуйте войти или укажите другую почту."
         "badly formatted" in lower || "invalid-email" in lower ->
-            "Некорректный email"
-        "network" in lower ->
-            "Проблема с сетью. Проверьте подключение"
+            "Некорректный email. Проверьте адрес почты."
+        "network" in lower || "unable to resolve host" in lower || "no address associated" in lower ||
+            "timeout" in lower || "timed out" in lower || "connection" in lower ||
+            "offline" in lower || "no route" in lower || "unavailable" in lower ->
+            "Проблема с сетью. Проверьте подключение и попробуйте еще раз."
         "weak password" in lower || "weak-password" in lower ->
-            "Слишком слабый пароль"
-        else -> raw
+            "Пароль слишком слабый. Проверьте требования к паролю."
+        "too many" in lower || "too-many-requests" in lower || "blocked" in lower ->
+            "Слишком много попыток. Подождите немного и попробуйте снова."
+        "user disabled" in lower || "user-disabled" in lower ->
+            "Этот аккаунт отключен. Обратитесь в поддержку."
+        "operation-not-allowed" in lower || "operation not allowed" in lower ->
+            "Вход по email сейчас недоступен. Попробуйте позже."
+        else -> "Не удалось выполнить действие. Проверьте данные и попробуйте еще раз."
     }
 }

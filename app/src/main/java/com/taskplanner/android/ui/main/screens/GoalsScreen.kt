@@ -15,6 +15,7 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.border
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
@@ -54,6 +55,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -68,12 +70,17 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionInParent
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.zIndex
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.taskplanner.android.core.model.GoalStatus
 import com.taskplanner.android.core.model.TaskPriority
@@ -90,6 +97,7 @@ import java.time.LocalTime
 import java.time.YearMonth
 import java.time.format.TextStyle
 import java.util.Locale
+import kotlin.math.roundToInt
 
 @Composable
 @OptIn(ExperimentalMaterial3Api::class)
@@ -99,7 +107,10 @@ fun GoalsScreen(
     onNavigateToTasks: (LocalDate, String?) -> Unit
 ) {
     val graph = LocalAppGraph.current
-    val vm: GoalsViewModel = viewModel(factory = GoalsViewModel.Factory(userId, graph.goalRepository, graph.categoryRepository))
+    val vm: GoalsViewModel = viewModel(
+        key = "goals-$userId",
+        factory = GoalsViewModel.Factory(userId, graph.goalRepository, graph.categoryRepository)
+    )
     val goals by vm.goals.collectAsState()
     val categories by vm.categories.collectAsState()
 
@@ -389,6 +400,17 @@ private fun GoalCard(
 ) {
     val progress = goal.progressCached.coerceIn(0.0, 1.0)
     val completedSteps = remember(steps) { steps.count { it.isCompleted } }
+    var visibleSteps by remember(goal.id) { mutableStateOf(steps) }
+    var draggingStepId by remember(goal.id) { mutableStateOf<String?>(null) }
+    var dragOffsetY by remember(goal.id) { mutableStateOf(0f) }
+    var stepBounds by remember(goal.id) { mutableStateOf<Map<String, ClosedFloatingPointRange<Float>>>(emptyMap()) }
+
+    LaunchedEffect(steps, draggingStepId) {
+        if (draggingStepId == null) {
+            visibleSteps = steps
+        }
+    }
+
     Card(
         shape = RoundedCornerShape(16.dp),
         colors = CardDefaults.cardColors(containerColor = Color.White),
@@ -456,7 +478,8 @@ private fun GoalCard(
 
                     Spacer(modifier = Modifier.height(10.dp))
 
-                    steps.forEach { step ->
+                    visibleSteps.forEach { step ->
+                        val isDragging = draggingStepId == step.id
                         GoalStepRow(
                             step = step,
                             viewModel = viewModel,
@@ -465,7 +488,54 @@ private fun GoalCard(
                             onDeleteStep = { onDeleteStep(step) },
                             onAddTask = { onAddTaskFromStep(step) },
                             onGoToTask = onGoToTask,
-                            onDeleteTask = { onDeleteTaskFromStep(step) }
+                            onDeleteTask = { onDeleteTaskFromStep(step) },
+                            modifier = Modifier
+                                .zIndex(if (isDragging) 1f else 0f)
+                                .offset { IntOffset(0, if (isDragging) dragOffsetY.roundToInt() else 0) }
+                                .onGloballyPositioned { coordinates ->
+                                    val top = coordinates.positionInParent().y
+                                    stepBounds = stepBounds + (step.id to top..(top + coordinates.size.height.toFloat()))
+                                }
+                                .pointerInput(visibleSteps) {
+                                    detectDragGesturesAfterLongPress(
+                                        onDragStart = {
+                                            draggingStepId = step.id
+                                            dragOffsetY = 0f
+                                        },
+                                        onDragCancel = {
+                                            draggingStepId = null
+                                            dragOffsetY = 0f
+                                            visibleSteps = steps
+                                        },
+                                        onDragEnd = {
+                                            val orderedIds = visibleSteps.map { it.id }
+                                            draggingStepId = null
+                                            dragOffsetY = 0f
+                                            viewModel.reorderSteps(goal.id, orderedIds)
+                                        },
+                                        onDrag = { change, dragAmount ->
+                                            val currentDraggingId = draggingStepId ?: return@detectDragGesturesAfterLongPress
+                                            dragOffsetY += dragAmount.y
+
+                                            val currentBounds = stepBounds[currentDraggingId] ?: return@detectDragGesturesAfterLongPress
+                                            val draggedCenter = (currentBounds.start + currentBounds.endInclusive) / 2f + dragOffsetY
+                                            val targetId = stepBounds.entries
+                                                .firstOrNull { (id, bounds) -> id != currentDraggingId && draggedCenter in bounds }
+                                                ?.key
+                                                ?: return@detectDragGesturesAfterLongPress
+
+                                            val fromIndex = visibleSteps.indexOfFirst { it.id == currentDraggingId }
+                                            val toIndex = visibleSteps.indexOfFirst { it.id == targetId }
+                                            if (fromIndex != -1 && toIndex != -1 && fromIndex != toIndex) {
+                                                visibleSteps = visibleSteps.toMutableList().also { list ->
+                                                    val moved = list.removeAt(fromIndex)
+                                                    list.add(toIndex, moved)
+                                                }
+                                                dragOffsetY = 0f
+                                            }
+                                        }
+                                    )
+                                }
                         )
                         Spacer(modifier = Modifier.height(10.dp))
                     }
@@ -527,7 +597,8 @@ private fun GoalStepRow(
     onDeleteStep: () -> Unit,
     onAddTask: () -> Unit,
     onGoToTask: (TaskEntity) -> Unit,
-    onDeleteTask: () -> Unit
+    onDeleteTask: () -> Unit,
+    modifier: Modifier = Modifier
 ) {
     val linkedTask by viewModel.linkedTaskForStep(step.id).collectAsState(initial = null)
     var menuExpanded by remember(step.id) { mutableStateOf(false) }
@@ -535,7 +606,7 @@ private fun GoalStepRow(
     Surface(
         color = Color.White,
         shape = RoundedCornerShape(14.dp),
-        modifier = Modifier
+        modifier = modifier
             .fillMaxWidth()
             .border(BorderStroke(0.5.dp, AppColors.SeparatorLight), RoundedCornerShape(14.dp))
     ) {
@@ -869,7 +940,7 @@ private fun StepToTaskBottomSheet(
                     onCreate(
                         description.trim().ifBlank { null },
                         selectedDate,
-                        if (timeEnabled) selectedTime else null,
+                        if (timeEnabled) selectedTime ?: LocalTime.of(9, 0) else null,
                         priority,
                         hasReminder && timeEnabled,
                         reminderOffset,
@@ -905,7 +976,15 @@ private fun StepToTaskBottomSheet(
                         Text("Указать время", fontSize = 16.sp, color = AppColors.Label, modifier = Modifier.weight(1f))
                         androidx.compose.material3.Switch(
                             checked = timeEnabled,
-                            onCheckedChange = { timeEnabled = it; if (!it) { selectedTime = null; hasReminder = false } },
+                            onCheckedChange = {
+                                timeEnabled = it
+                                if (!it) {
+                                    selectedTime = null
+                                    hasReminder = false
+                                } else if (selectedTime == null) {
+                                    selectedTime = LocalTime.of(9, 0)
+                                }
+                            },
                             colors = androidx.compose.material3.SwitchDefaults.colors(
                                 checkedThumbColor = Color.White, checkedTrackColor = AppColors.Green,
                                 uncheckedThumbColor = Color.White, uncheckedTrackColor = Color(0xFFE5E5EA),
@@ -1044,19 +1123,31 @@ private fun PriorityChip(text: String, selected: Boolean, onClick: () -> Unit) {
 
 @Composable
 private fun ReminderOffsetPicker(selected: Int, onSelected: (Int) -> Unit) {
-    val options = listOf(0, 5, 10, 15, 30, 60)
-    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(vertical = 8.dp)) {
-        options.forEach { minutes ->
-            val label = if (minutes == 0) "В момент" else "За ${minutes} мин"
-            val isSelected = selected == minutes
-            Surface(
-                shape = RoundedCornerShape(999.dp),
-                color = if (isSelected) MaterialTheme.colorScheme.primary.copy(alpha = 0.18f) else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f),
-                modifier = Modifier
-                    .clip(RoundedCornerShape(999.dp))
-                    .clickable { onSelected(minutes) }
-            ) {
-                Text(label, modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp), style = MaterialTheme.typography.labelSmall)
+    var expanded by remember { mutableStateOf(false) }
+    fun label(minutes: Int) = if (minutes == 0) "В момент" else "${minutes} мин"
+
+    Box {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable { expanded = true }
+                .padding(top = 10.dp, bottom = 6.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text("Когда напомнить", modifier = Modifier.weight(1f), fontSize = 16.sp, color = AppColors.Label)
+            Text(label(selected), color = AppColors.Blue, fontSize = 16.sp, fontWeight = FontWeight.Medium)
+            Icon(Icons.Filled.ExpandMore, null, tint = AppColors.Blue, modifier = Modifier.size(16.dp))
+        }
+        IosDropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+            listOf(0, 5, 10, 15, 30, 60).forEach { minutes ->
+                IosMenuItem(
+                    label(minutes),
+                    Icons.Outlined.CalendarMonth,
+                    if (selected == minutes) AppColors.Blue else AppColors.Label
+                ) {
+                    onSelected(minutes)
+                    expanded = false
+                }
             }
         }
     }

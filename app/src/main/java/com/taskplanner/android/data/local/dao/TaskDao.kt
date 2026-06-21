@@ -122,6 +122,35 @@ interface TaskDao {
         SELECT MAX(position) FROM tasks
         WHERE userId = :userId
           AND deletedAt IS NULL
+          AND parentTaskId IS NULL
+          AND date >= :startInclusive AND date < :endExclusive
+        """
+    )
+    suspend fun getMaxPositionForDay(userId: String, startInclusive: Long, endExclusive: Long): Int?
+
+    @Query(
+        """
+        SELECT COUNT(*) FROM tasks
+        WHERE userId = :userId
+          AND deletedAt IS NULL
+          AND parentTaskId IS NULL
+          AND date >= :startInclusive AND date < :endExclusive
+          AND id NOT IN (
+              SELECT sourceTaskId FROM recurrence_rules
+              WHERE userId = :userId
+                AND deletedAt IS NULL
+                AND sourceTaskId IS NOT NULL
+                AND sourceTaskId != ''
+          )
+        """
+    )
+    suspend fun countTopLevelForDay(userId: String, startInclusive: Long, endExclusive: Long): Int
+
+    @Query(
+        """
+        SELECT MAX(position) FROM tasks
+        WHERE userId = :userId
+          AND deletedAt IS NULL
           AND parentTaskId = :parentTaskId
         """
     )
@@ -142,11 +171,57 @@ interface TaskDao {
         """
         SELECT * FROM tasks
         WHERE userId = :userId
+          AND deletedAt IS NULL
+          AND parentTaskId IS NULL
+          AND date >= :startInclusive AND date < :endExclusive
+          AND id NOT IN (
+              SELECT sourceTaskId FROM recurrence_rules
+              WHERE userId = :userId
+                AND deletedAt IS NULL
+                AND sourceTaskId IS NOT NULL
+                AND sourceTaskId != ''
+          )
+        ORDER BY date ASC
+        """
+    )
+    suspend fun getVisibleForStatistics(
+        userId: String,
+        startInclusive: Long,
+        endExclusive: Long
+    ): List<TaskEntity>
+
+    @Query(
+        """
+        SELECT * FROM tasks
+        WHERE userId = :userId
+          AND deletedAt IS NULL
+          AND parentTaskId IS NULL
+          AND date >= :startInclusive AND date < :endExclusive
+        ORDER BY position ASC, createdAt DESC, id ASC
+        """
+    )
+    suspend fun getTopLevelForDay(userId: String, startInclusive: Long, endExclusive: Long): List<TaskEntity>
+
+    @Query(
+        """
+        SELECT * FROM tasks
+        WHERE userId = :userId
           AND date >= :startInclusive AND date < :endExclusive
         ORDER BY date ASC
         """
     )
     suspend fun getForRangeAny(userId: String, startInclusive: Long, endExclusive: Long): List<TaskEntity>
+
+    @Query(
+        """
+        SELECT * FROM tasks
+        WHERE userId = :userId
+          AND deletedAt IS NULL
+          AND originType = :originType
+          AND recurrenceRuleId IS NOT NULL
+        """
+    )
+    suspend fun getActiveGeneratedRecurrenceTasks(userId: String, originType: Int): List<TaskEntity>
 
     @Query(
         """
@@ -218,8 +293,30 @@ interface TaskDao {
     )
     suspend fun countForTemplateApplication(userId: String, applicationId: String): Int
 
+    @Query(
+        """
+        SELECT * FROM tasks
+        WHERE userId = :userId
+          AND templateApplicationId = :applicationId
+          AND deletedAt IS NULL
+        ORDER BY date ASC, position ASC, createdAt DESC
+        """
+    )
+    fun observeForTemplateApplication(userId: String, applicationId: String): Flow<List<TaskEntity>>
+
     @Query("UPDATE tasks SET deletedAt = :deletedAt, updatedAt = :updatedAt, syncStatus = :syncStatus WHERE id = :id AND userId = :userId")
     suspend fun softDelete(userId: String, id: String, deletedAt: Long, updatedAt: Long, syncStatus: Int)
+
+    @Query(
+        """
+        UPDATE tasks
+        SET categoryId = :newCategoryId, updatedAt = :updatedAt, syncStatus = :syncStatus
+        WHERE userId = :userId
+          AND categoryId = :oldCategoryId
+          AND deletedAt IS NULL
+        """
+    )
+    suspend fun replaceCategoryId(userId: String, oldCategoryId: String, newCategoryId: String, updatedAt: Long, syncStatus: Int)
 
     @Query(
         """
@@ -259,13 +356,42 @@ interface TaskDao {
     @Query(
         """
         UPDATE tasks
-        SET recurrenceRuleId = NULL, instanceDate = NULL,
+        SET recurrenceRuleId = NULL, instanceDate = NULL, originType = :manualOriginType,
             updatedAt = :updatedAt, syncStatus = :syncStatus
         WHERE userId = :userId AND recurrenceRuleId = :ruleId
           AND deletedAt IS NULL AND date < :before
         """
     )
-    suspend fun detachFromRuleBefore(userId: String, ruleId: String, before: Long, updatedAt: Long, syncStatus: Int)
+    suspend fun detachFromRuleBefore(
+        userId: String,
+        ruleId: String,
+        before: Long,
+        manualOriginType: Int,
+        updatedAt: Long,
+        syncStatus: Int
+    )
+
+    @Query(
+        """
+        UPDATE tasks
+        SET deletedAt = NULL, recurrenceRuleId = NULL, instanceDate = NULL,
+            originType = :manualOriginType, updatedAt = :updatedAt, syncStatus = :syncStatus
+        WHERE userId = :userId
+          AND recurrenceRuleId = :ruleId
+          AND originType = :recurrenceOriginType
+          AND date >= :startInclusive AND date < :endExclusive
+        """
+    )
+    suspend fun restoreGeneratedTaskForDay(
+        userId: String,
+        ruleId: String,
+        recurrenceOriginType: Int,
+        manualOriginType: Int,
+        startInclusive: Long,
+        endExclusive: Long,
+        updatedAt: Long,
+        syncStatus: Int
+    )
 
     @Query(
         """

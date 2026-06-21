@@ -46,6 +46,14 @@ class TasksViewModel(
         categoryRepository.observeAll(userId)
             .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
+    val filterCategories: StateFlow<List<CategoryEntity>> =
+        categoryRepository.observeForTaskFilter(userId)
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    val allCategories: StateFlow<List<CategoryEntity>> =
+        categoryRepository.observeAllIncludingDeleted(userId)
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
     private val baseTasks: StateFlow<List<TaskEntity>> = _selectedDate
         .flatMapLatest { date -> taskRepository.observeTasksForDate(userId, date) }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
@@ -213,6 +221,13 @@ class TasksViewModel(
     fun persistCustomOrder(orderedIds: List<String>) {
         viewModelScope.launch {
             taskRepository.persistCustomOrder(userId, orderedIds)
+        }
+    }
+
+    fun sortCurrentDayByTime() {
+        sort.value = Sort.CUSTOM
+        viewModelScope.launch {
+            taskRepository.sortTasksByTime(userId, _selectedDate.value)
         }
     }
 

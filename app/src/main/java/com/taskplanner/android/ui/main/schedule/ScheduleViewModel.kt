@@ -39,9 +39,8 @@ data class RecurrenceSeriesUi(
 ) {
     val isActive: Boolean
         get() {
-            val today = TimeUtils.startOfDayMillis(LocalDate.now())
             val end = rule.endDate
-            return end == null || end > today
+            return end == null || TimeUtils.localDateFromMillis(end).isAfter(LocalDate.now())
         }
 }
 
@@ -162,6 +161,10 @@ class ScheduleViewModel(
 
     fun observeTemplateApplications(templateId: String): Flow<List<TemplateApplicationEntity>> {
         return templateRepository.observeApplications(userId, templateId)
+    }
+
+    fun observeTemplateApplicationTasks(applicationId: String): Flow<List<TaskEntity>> {
+        return templateRepository.observeTasksForApplication(userId, applicationId)
     }
 
     fun updateTemplate(templateId: String, title: String, description: String?) {

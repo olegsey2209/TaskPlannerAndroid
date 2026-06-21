@@ -146,12 +146,31 @@ object TaskSyncMapper {
 }
 
 object CategorySyncMapper {
+    private fun normalizedIconName(iconName: String?): String {
+        return when (iconName) {
+            "tag" -> "tag.fill"
+            "person" -> "person.fill"
+            "work" -> "briefcase.fill"
+            "home" -> "house.fill"
+            "school" -> "book.fill"
+            "favorite" -> "heart.fill"
+            "fitness_center" -> "figure.run"
+            "palette" -> "paintpalette.fill"
+            "shopping_cart" -> "cart.fill"
+            "directions_car" -> "car.fill"
+            "flight" -> "airplane"
+            "sports_esports" -> "gamecontroller.fill"
+            null, "" -> "tag.fill"
+            else -> iconName
+        }
+    }
+
     fun toFirestore(c: CategoryEntity): Map<String, Any?> {
         return mapOf(
             "id" to c.id,
             "userId" to c.userId,
             "name" to c.name,
-            "iconName" to c.iconName,
+            "iconName" to normalizedIconName(c.iconName),
             "colorHex" to c.colorHex,
             "sortOrder" to c.sortOrder,
             "isArchived" to c.isArchived,
@@ -169,7 +188,7 @@ object CategorySyncMapper {
             id = id,
             userId = userId,
             name = SyncMapperHelpers.stringFromAny(data["name"]) ?: existing?.name ?: "",
-            iconName = SyncMapperHelpers.stringFromAny(data["iconName"])?.takeIf { it.isNotBlank() } ?: existing?.iconName ?: "tag.fill",
+            iconName = normalizedIconName(SyncMapperHelpers.stringFromAny(data["iconName"])?.takeIf { it.isNotBlank() } ?: existing?.iconName),
             colorHex = SyncMapperHelpers.stringFromAny(data["colorHex"]) ?: existing?.colorHex ?: "#007AFF",
             sortOrder = SyncMapperHelpers.intFromAny(data["sortOrder"]) ?: existing?.sortOrder ?: 0,
             isArchived = SyncMapperHelpers.boolFromAny(data["isArchived"]) ?: existing?.isArchived ?: false,
@@ -367,8 +386,13 @@ object ScheduleTemplateItemSyncMapper {
             userId = userId,
             templateId = templateId,
             weekday = SyncMapperHelpers.intFromAny(data["weekday"]) ?: existing?.weekday ?: 1,
-            title = SyncMapperHelpers.stringFromAny(data["title"]) ?: existing?.title ?: "",
-            description = SyncMapperHelpers.stringFromAny(data["itemDescription"]),
+            title = SyncMapperHelpers.stringFromAny(data["title"])
+                ?: SyncMapperHelpers.stringFromAny(data["taskTitle"])
+                ?: existing?.title
+                ?: "",
+            description = SyncMapperHelpers.stringFromAny(data["itemDescription"])
+                ?: SyncMapperHelpers.stringFromAny(data["description"])
+                ?: existing?.description,
             startTime = SyncMapperHelpers.epochMillisFromAny(data["startTime"]),
             priority = SyncMapperHelpers.intFromAny(data["priority"]) ?: existing?.priority ?: 1,
             hasReminder = SyncMapperHelpers.boolFromAny(data["hasReminder"]) ?: existing?.hasReminder ?: false,
@@ -424,11 +448,12 @@ object TemplateApplicationSyncMapper {
 
 object UserProfileSyncMapper {
     fun toFirestore(p: UserProfileEntity): Map<String, Any?> {
+        val name = usableName(p.username, p.email)
         return mapOf(
             "id" to p.id,
             "email" to p.email,
-            "username" to p.username,
-            "displayName" to p.username,
+            "username" to name,
+            "displayName" to name,
             "lastLoginAt" to SyncMapperHelpers.timestamp(p.lastLoginAt),
             "createdAt" to SyncMapperHelpers.timestamp(p.createdAt),
             "updatedAt" to SyncMapperHelpers.timestamp(p.updatedAt),
@@ -439,17 +464,42 @@ object UserProfileSyncMapper {
 
     fun fromFirestore(data: Map<String, Any?>, existing: UserProfileEntity?): UserProfileEntity? {
         val id = SyncMapperHelpers.stringFromAny(data["id"]) ?: return null
+        val email = SyncMapperHelpers.stringFromAny(data["email"]) ?: existing?.email
+        val username = usableName(SyncMapperHelpers.stringFromAny(data["displayName"]), email)
+            ?: usableName(SyncMapperHelpers.stringFromAny(data["username"]), email)
+            ?: usableName(existing?.username, email)
+
         return UserProfileEntity(
             id = id,
-            email = SyncMapperHelpers.stringFromAny(data["email"]) ?: existing?.email,
-            username = SyncMapperHelpers.stringFromAny(data["username"])
-                ?: SyncMapperHelpers.stringFromAny(data["displayName"])
-                ?: existing?.username,
+            email = email,
+            username = username,
             createdAt = SyncMapperHelpers.epochMillisFromAny(data["createdAt"]) ?: existing?.createdAt ?: System.currentTimeMillis(),
             updatedAt = SyncMapperHelpers.epochMillisFromAny(data["updatedAt"]) ?: existing?.updatedAt ?: System.currentTimeMillis(),
             lastLoginAt = SyncMapperHelpers.epochMillisFromAny(data["lastLoginAt"]) ?: existing?.lastLoginAt ?: System.currentTimeMillis(),
             deletedAt = SyncMapperHelpers.epochMillisFromAny(data["deletedAt"]),
             syncStatus = SyncStatus.SYNCED.raw
         )
+    }
+
+    fun hasUsableName(data: Map<String, Any?>, fallbackEmail: String?): Boolean {
+        val email = SyncMapperHelpers.stringFromAny(data["email"]) ?: fallbackEmail
+        return usableName(SyncMapperHelpers.stringFromAny(data["displayName"]), email) != null ||
+            usableName(SyncMapperHelpers.stringFromAny(data["username"]), email) != null
+    }
+
+    fun hasUsableName(profile: UserProfileEntity): Boolean {
+        return usableName(profile.username, profile.email) != null
+    }
+
+    private fun usableName(value: String?, email: String?): String? {
+        val trimmed = value?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+        val normalized = trimmed.lowercase()
+        val normalizedEmail = email?.trim()?.lowercase()
+        val emailPrefix = normalizedEmail?.substringBefore('@')
+
+        if ('@' in normalized || normalized == normalizedEmail || normalized == emailPrefix) {
+            return null
+        }
+        return trimmed
     }
 }

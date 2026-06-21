@@ -7,6 +7,9 @@ import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import com.taskplanner.android.core.model.SyncStatus
+import com.taskplanner.android.core.model.GoalStatus
+import com.taskplanner.android.core.model.TaskOriginType
+import com.taskplanner.android.core.model.TaskStatus
 import com.taskplanner.android.data.local.AppDatabase
 import com.taskplanner.android.sync.mappers.CategorySyncMapper
 import com.taskplanner.android.sync.mappers.GoalStepSyncMapper
@@ -57,6 +60,8 @@ class SyncEngine(
 
     private val keyLastSync = longPreferencesKey("lastSyncDate")
     private fun keyInitialDone(uid: String) = booleanPreferencesKey("initialSyncCompleted_$uid")
+    private fun keyLegacyCategoryRepairDone(uid: String) =
+        booleanPreferencesKey("legacyCategoryRepairV1_$uid")
 
     fun observeLastSyncDate(): Flow<Long?> =
         context.syncDataStore.data.map { prefs: Preferences -> prefs[keyLastSync] }
@@ -144,10 +149,31 @@ class SyncEngine(
         uploadLocalChanges(userId)
         
         downloadRemoteChanges(userId)
+        if (repairLegacyDeletedCategoriesIfNeeded(userId)) {
+            uploadLocalChanges(userId)
+        }
+        if (repairDeletedRecurrenceBoundaryTasks(userId)) {
+            uploadLocalChanges(userId)
+        }
+        if (reconcileGoalStepsFromLinkedTasks(userId)) {
+            uploadLocalChanges(userId)
+        }
+        if (normalizeCategoryIcons(userId)) {
+            uploadLocalChanges(userId)
+        }
+        if (deduplicateActiveCategories(userId)) {
+            uploadLocalChanges(userId)
+        }
+        if (deduplicateGeneratedRecurrenceTasks(userId)) {
+            uploadLocalChanges(userId)
+        }
 
 
         if (pendingResumeUserIds.remove(userId)) {
             recurrenceRepo.generateUpcomingTasksIfNeeded(userId)
+            if (deduplicateGeneratedRecurrenceTasks(userId)) {
+                uploadLocalChanges(userId)
+            }
         }
     }
 
@@ -164,6 +190,24 @@ class SyncEngine(
         }
 
         downloadRemoteChanges(userId)
+        if (repairLegacyDeletedCategoriesIfNeeded(userId)) {
+            uploadLocalChanges(userId)
+        }
+        if (repairDeletedRecurrenceBoundaryTasks(userId)) {
+            uploadLocalChanges(userId)
+        }
+        if (reconcileGoalStepsFromLinkedTasks(userId)) {
+            uploadLocalChanges(userId)
+        }
+        if (normalizeCategoryIcons(userId)) {
+            uploadLocalChanges(userId)
+        }
+        if (deduplicateActiveCategories(userId)) {
+            uploadLocalChanges(userId)
+        }
+        if (deduplicateGeneratedRecurrenceTasks(userId)) {
+            uploadLocalChanges(userId)
+        }
         context.syncDataStore.edit { prefs -> prefs[key] = true }
         return true
     }
@@ -174,6 +218,100 @@ class SyncEngine(
             firestore.isCollectionEmpty(userId, SyncEntityType.GOAL) &&
             firestore.isCollectionEmpty(userId, SyncEntityType.TEMPLATE) &&
             firestore.isCollectionEmpty(userId, SyncEntityType.USER_PROFILE)
+    }
+
+    private suspend fun reconcileGoalStepsFromLinkedTasks(userId: String): Boolean {
+        val activeTasksByStep = db.taskDao()
+            .getAllForUser(userId)
+            .asSequence()
+            .filter { it.deletedAt == null && !it.goalStepId.isNullOrBlank() }
+            .groupBy { it.goalStepId!! }
+
+        val changedGoalIds = mutableSetOf<String>()
+        var changed = false
+
+        db.goalStepDao().getAllForUser(userId)
+            .filter { it.deletedAt == null }
+            .forEach { step ->
+                val newestTask = activeTasksByStep[step.id]?.maxByOrNull { it.updatedAt } ?: return@forEach
+                val taskIsCompleted = newestTask.status == TaskStatus.COMPLETED.raw
+
+                if (newestTask.updatedAt >= step.updatedAt && step.isCompleted != taskIsCompleted) {
+                    val now = System.currentTimeMillis()
+                    db.goalStepDao().update(
+                        step.copy(
+                            isCompleted = taskIsCompleted,
+                            completedAt = if (taskIsCompleted) newestTask.completedAt ?: now else null,
+                            updatedAt = now,
+                            syncStatus = SyncStatus.UPDATED_LOCAL.raw
+                        )
+                    )
+                    changedGoalIds += step.goalId
+                    changed = true
+                }
+            }
+
+        changedGoalIds.forEach { goalId ->
+            val goal = db.goalDao().getById(userId, goalId) ?: return@forEach
+            val steps = db.goalStepDao().getForGoal(userId, goalId).filter { it.deletedAt == null }
+            val progress = if (steps.isEmpty()) 0.0 else steps.count { it.isCompleted }.toDouble() / steps.size.toDouble()
+            val now = System.currentTimeMillis()
+            val isCompleted = progress >= 1.0
+            db.goalDao().update(
+                goal.copy(
+                    progressCached = progress,
+                    status = if (isCompleted) GoalStatus.COMPLETED.raw else GoalStatus.ACTIVE.raw,
+                    completedAt = if (isCompleted) goal.completedAt ?: now else null,
+                    updatedAt = now,
+                    syncStatus = SyncStatus.UPDATED_LOCAL.raw
+                )
+            )
+        }
+
+        return changed
+    }
+
+    private suspend fun repairDeletedRecurrenceBoundaryTasks(userId: String): Boolean {
+        val tasks = db.taskDao().getAllForUser(userId)
+        var changed = false
+
+        db.recurrenceRuleDao().getAllForUser(userId)
+            .filter { it.deletedAt != null }
+            .forEach { rule ->
+                val deletedAt = rule.deletedAt ?: return@forEach
+                val deletionDay = com.taskplanner.android.core.util.TimeUtils.startOfDayMillis(
+                    com.taskplanner.android.core.util.TimeUtils.localDateFromMillis(deletedAt)
+                )
+                val nextDay = com.taskplanner.android.core.util.TimeUtils.startOfDayMillis(
+                    com.taskplanner.android.core.util.TimeUtils.localDateFromMillis(deletedAt).plusDays(1)
+                )
+
+                tasks.asSequence()
+                    .filter {
+                        it.recurrenceRuleId == rule.id &&
+                            it.originType == TaskOriginType.RECURRENCE.raw &&
+                            it.deletedAt != null &&
+                            it.date >= deletionDay &&
+                            it.date < nextDay &&
+                            kotlin.math.abs((it.deletedAt ?: 0L) - deletedAt) <= 60_000L
+                    }
+                    .forEach { task ->
+                        val now = System.currentTimeMillis()
+                        db.taskDao().upsert(
+                            task.copy(
+                                recurrenceRuleId = null,
+                                instanceDate = null,
+                                originType = TaskOriginType.MANUAL.raw,
+                                deletedAt = null,
+                                updatedAt = now,
+                                syncStatus = SyncStatus.UPDATED_LOCAL.raw
+                            )
+                        )
+                        changed = true
+                    }
+            }
+
+        return changed
     }
 
     
@@ -226,7 +364,10 @@ class SyncEngine(
                             db.taskDao().upsert(task)
                             
                             com.taskplanner.android.notifications.NotificationHelper.cancelReminder(context, task.id)
-                            if (task.hasReminder && task.deletedAt == null) {
+                            if (task.hasReminder &&
+                                task.deletedAt == null &&
+                                task.status == TaskStatus.PLANNED.raw
+                            ) {
                                 com.taskplanner.android.notifications.NotificationHelper.scheduleReminder(context, task)
                             }
                         }
@@ -234,12 +375,23 @@ class SyncEngine(
                 }
                 SyncEntityType.CATEGORY -> {
                     val existing = db.categoryDao().getByIdAny(userId, remoteId)
-                        ?: SyncMapperHelpers.stringFromAny(data["name"])
-                            ?.let { db.categoryDao().getByName(userId, it) }
-                    val localUpd_category = existing?.updatedAt ?: Long.MIN_VALUE
-                    if (existing != null && existing.syncStatus != syncedRaw && localUpd_category >= remoteUpdated) continue
+                    val remoteDeletedAt = SyncMapperHelpers.epochMillisFromAny(data["deletedAt"])
+                    val remoteCreatedAt = SyncMapperHelpers.epochMillisFromAny(data["createdAt"])
                     val localUpdated = existing?.updatedAt ?: Long.MIN_VALUE
-                    if (existing == null || remoteUpdated > localUpdated) {
+
+                    if (existing == null && remoteDeletedAt == null) {
+                        val remoteName = SyncMapperHelpers.stringFromAny(data["name"])?.trim().orEmpty()
+                        if (remoteName.isNotEmpty()) {
+                            val deletedCategory = db.categoryDao().getDeletedByName(userId, remoteName)
+                            val deletedAt = deletedCategory?.deletedAt
+                            if (deletedAt != null && (remoteCreatedAt == null || remoteCreatedAt <= deletedAt)) continue
+                        }
+                    }
+
+                    if (existing?.deletedAt != null && remoteDeletedAt == null) continue
+                    if (existing != null && existing.syncStatus != syncedRaw && localUpdated >= remoteUpdated) continue
+
+                    if (existing == null || remoteUpdated > localUpdated || (remoteDeletedAt != null && existing.deletedAt == null)) {
                         CategorySyncMapper.fromFirestore(data, existing)?.let { db.categoryDao().upsert(it) }
                     }
                 }
@@ -278,12 +430,62 @@ class SyncEngine(
                     )) {
                         val now = System.currentTimeMillis()
                         val today = com.taskplanner.android.core.util.TimeUtils.startOfDayMillis(java.time.LocalDate.now())
+                        val tomorrow = com.taskplanner.android.core.util.TimeUtils.startOfDayMillis(java.time.LocalDate.now().plusDays(1))
+                        val sourceTask = db.taskDao().getByIdAny(userId, mapped.sourceTaskId)
+                        val sourceHasGeneratedOccurrence = sourceTask?.let { source ->
+                            val sourceDate = com.taskplanner.android.core.util.TimeUtils.localDateFromMillis(source.date)
+                            val sourceDay = com.taskplanner.android.core.util.TimeUtils.startOfDayMillis(sourceDate)
+                            val sourceDayEnd = com.taskplanner.android.core.util.TimeUtils.startOfDayMillis(sourceDate.plusDays(1))
+                            db.taskDao().getForRange(userId, sourceDay, sourceDayEnd).any {
+                                it.recurrenceRuleId == remoteId &&
+                                    it.originType == TaskOriginType.RECURRENCE.raw &&
+                                    it.deletedAt == null
+                            }
+                        } ?: false
 
                         when {
                             mapped.deletedAt != null && (existing == null || existing.deletedAt == null) -> {
                                 db.recurrenceRuleDao().upsert(mapped)
-                                db.taskDao().softDeleteGeneratedForRuleFromDate(userId, remoteId, com.taskplanner.android.core.model.TaskOriginType.RECURRENCE.raw, today, now)
-                                db.taskDao().detachFromRuleBefore(userId, remoteId, today, now, 3)
+                                db.taskDao().restoreGeneratedTaskForDay(
+                                    userId = userId,
+                                    ruleId = remoteId,
+                                    recurrenceOriginType = TaskOriginType.RECURRENCE.raw,
+                                    manualOriginType = TaskOriginType.MANUAL.raw,
+                                    startInclusive = today,
+                                    endExclusive = tomorrow,
+                                    updatedAt = now,
+                                    syncStatus = SyncStatus.UPDATED_LOCAL.raw
+                                )
+                                db.taskDao().softDeleteGeneratedForRuleFromDate(userId, remoteId, TaskOriginType.RECURRENCE.raw, tomorrow, now)
+                                db.taskDao().detachFromRuleBefore(
+                                    userId = userId,
+                                    ruleId = remoteId,
+                                    before = tomorrow,
+                                    manualOriginType = TaskOriginType.MANUAL.raw,
+                                    updatedAt = now,
+                                    syncStatus = SyncStatus.UPDATED_LOCAL.raw
+                                )
+                                if (sourceTask != null && sourceTask.deletedAt == null) {
+                                    if (sourceHasGeneratedOccurrence) {
+                                        db.taskDao().softDelete(
+                                            userId = userId,
+                                            id = sourceTask.id,
+                                            deletedAt = now,
+                                            updatedAt = now,
+                                            syncStatus = SyncStatus.DELETED_LOCAL.raw
+                                        )
+                                    } else {
+                                        db.taskDao().upsert(
+                                            sourceTask.copy(
+                                                recurrenceRuleId = null,
+                                                instanceDate = null,
+                                                originType = TaskOriginType.MANUAL.raw,
+                                                updatedAt = now,
+                                                syncStatus = SyncStatus.UPDATED_LOCAL.raw
+                                            )
+                                        )
+                                    }
+                                }
                             }
                             mapped.deletedAt == null && mapped.endDate != null && mapped.endDate != existing?.endDate -> {
 
@@ -346,14 +548,214 @@ class SyncEngine(
                 }
                 SyncEntityType.USER_PROFILE -> {
                     val existing = db.userProfileDao().getById(remoteId)
-                    if (existing != null && existing.syncStatus != syncedRaw) continue
                     val localUpdated = existing?.updatedAt ?: Long.MIN_VALUE
-                    if (existing == null || remoteUpdated > localUpdated) {
+                    val shouldFillMissingName =
+                        existing != null &&
+                            !UserProfileSyncMapper.hasUsableName(existing) &&
+                            UserProfileSyncMapper.hasUsableName(data, existing.email)
+
+                    if (existing != null && existing.syncStatus != syncedRaw && !shouldFillMissingName) continue
+                    if (existing == null || remoteUpdated > localUpdated || shouldFillMissingName) {
                         UserProfileSyncMapper.fromFirestore(data, existing)?.let { db.userProfileDao().upsert(it) }
                     }
                 }
             }
         }
+    }
+
+    private suspend fun deduplicateActiveCategories(userId: String): Boolean {
+        val categories = db.categoryDao().getAll(userId)
+        val duplicateGroups = categories
+            .groupBy { it.name.trim().lowercase() }
+            .values
+            .filter { it.size > 1 }
+
+        if (duplicateGroups.isEmpty()) return false
+
+        val now = System.currentTimeMillis()
+        var didChange = false
+
+        duplicateGroups.forEach { duplicates ->
+            val ordered = duplicates.sortedWith(
+                compareBy<com.taskplanner.android.data.local.entities.CategoryEntity> { it.sortOrder }
+                    .thenBy { it.createdAt }
+                    .thenBy { it.id }
+            )
+
+            var keeper = ordered.firstOrNull() ?: return@forEach
+            ordered.drop(1).forEach { duplicate ->
+                val recoveredIcon = keeper.iconName.isBlank() && duplicate.iconName.isNotBlank()
+                val recoveredColor = keeper.colorHex.isBlank() && duplicate.colorHex.isNotBlank()
+                if (recoveredIcon || recoveredColor) {
+                    keeper = keeper.copy(
+                        iconName = if (recoveredIcon) duplicate.iconName else keeper.iconName,
+                        colorHex = if (recoveredColor) duplicate.colorHex else keeper.colorHex,
+                        updatedAt = now,
+                        syncStatus = SyncStatus.UPDATED_LOCAL.raw
+                    )
+                    db.categoryDao().upsert(keeper)
+                    didChange = true
+                }
+
+                db.taskDao().replaceCategoryId(
+                    userId = userId,
+                    oldCategoryId = duplicate.id,
+                    newCategoryId = keeper.id,
+                    updatedAt = now,
+                    syncStatus = SyncStatus.UPDATED_LOCAL.raw
+                )
+                db.scheduleTemplateItemDao().replaceCategoryId(
+                    userId = userId,
+                    oldCategoryId = duplicate.id,
+                    newCategoryId = keeper.id,
+                    updatedAt = now,
+                    syncStatus = SyncStatus.UPDATED_LOCAL.raw
+                )
+                db.categoryDao().upsert(
+                    duplicate.copy(
+                        deletedAt = now,
+                        updatedAt = now,
+                        syncStatus = SyncStatus.DELETED_LOCAL.raw
+                    )
+                )
+                didChange = true
+            }
+        }
+
+        return didChange
+    }
+
+    private suspend fun repairLegacyDeletedCategoriesIfNeeded(userId: String): Boolean {
+        val key = keyLegacyCategoryRepairDone(userId)
+        val alreadyRepaired = context.syncDataStore.data.map { it[key] ?: false }.first()
+        if (alreadyRepaired) return false
+
+        val categories = db.categoryDao().getAllForUser(userId)
+        val groups = categories.groupBy { it.name.trim().lowercase() }
+        val now = System.currentTimeMillis()
+        var didRepair = false
+
+        groups.values.forEach { group ->
+            val active = group.filter { it.deletedAt == null }
+            val deleted = group.filter { it.deletedAt != null }
+
+            // Старый дедупликатор на двух устройствах мог выбрать разные ID,
+            // из-за чего в облаке удалялись обе копии одной категории.
+            if (active.isNotEmpty() || deleted.size < 2) return@forEach
+
+            val keeper = deleted.sortedWith(
+                compareBy<com.taskplanner.android.data.local.entities.CategoryEntity> { it.sortOrder }
+                    .thenBy { it.createdAt }
+                    .thenBy { it.id }
+            ).first()
+
+            db.categoryDao().upsert(
+                keeper.copy(
+                    deletedAt = null,
+                    updatedAt = now,
+                    syncStatus = SyncStatus.UPDATED_LOCAL.raw
+                )
+            )
+
+            deleted.filter { it.id != keeper.id }.forEach { duplicate ->
+                db.taskDao().replaceCategoryId(
+                    userId = userId,
+                    oldCategoryId = duplicate.id,
+                    newCategoryId = keeper.id,
+                    updatedAt = now,
+                    syncStatus = SyncStatus.UPDATED_LOCAL.raw
+                )
+                db.scheduleTemplateItemDao().replaceCategoryId(
+                    userId = userId,
+                    oldCategoryId = duplicate.id,
+                    newCategoryId = keeper.id,
+                    updatedAt = now,
+                    syncStatus = SyncStatus.UPDATED_LOCAL.raw
+                )
+            }
+            didRepair = true
+        }
+
+        context.syncDataStore.edit { preferences ->
+            preferences[key] = true
+        }
+        return didRepair
+    }
+
+    private suspend fun normalizeCategoryIcons(userId: String): Boolean {
+        val categories = db.categoryDao().getAllForUser(userId)
+        val now = System.currentTimeMillis()
+        var didChange = false
+
+        categories.forEach { category ->
+            val normalized = normalizedCategoryIconName(category.iconName)
+            if (category.iconName != normalized) {
+                db.categoryDao().upsert(
+                    category.copy(
+                        iconName = normalized,
+                        updatedAt = now,
+                        syncStatus = if (category.deletedAt == null) SyncStatus.UPDATED_LOCAL.raw else category.syncStatus
+                    )
+                )
+                didChange = true
+            }
+        }
+
+        return didChange
+    }
+
+    private fun normalizedCategoryIconName(iconName: String): String {
+        return when (iconName) {
+            "tag" -> "tag.fill"
+            "person" -> "person.fill"
+            "work" -> "briefcase.fill"
+            "home" -> "house.fill"
+            "school" -> "book.fill"
+            "favorite" -> "heart.fill"
+            "fitness_center" -> "figure.run"
+            "palette" -> "paintpalette.fill"
+            "shopping_cart" -> "cart.fill"
+            "directions_car" -> "car.fill"
+            "flight" -> "airplane"
+            "sports_esports" -> "gamecontroller.fill"
+            "" -> "tag.fill"
+            else -> iconName
+        }
+    }
+
+    private suspend fun deduplicateGeneratedRecurrenceTasks(userId: String): Boolean {
+        val tasks = db.taskDao().getActiveGeneratedRecurrenceTasks(userId, TaskOriginType.RECURRENCE.raw)
+        val duplicateGroups = tasks.groupBy { task ->
+            val instanceDay = task.instanceDate ?: task.date
+            "${task.recurrenceRuleId.orEmpty()}|$instanceDay"
+        }.values.filter { it.size > 1 }
+
+        if (duplicateGroups.isEmpty()) return false
+
+        val now = System.currentTimeMillis()
+        var didDeleteDuplicates = false
+        duplicateGroups.forEach { duplicates ->
+            val ordered = duplicates.sortedWith(
+                compareByDescending<com.taskplanner.android.data.local.entities.TaskEntity> {
+                    it.status == TaskStatus.COMPLETED.raw
+                }
+                    .thenByDescending { it.updatedAt }
+                    .thenBy { it.createdAt }
+            )
+
+            ordered.drop(1).forEach { task ->
+                db.taskDao().softDelete(
+                    userId = userId,
+                    id = task.id,
+                    deletedAt = now,
+                    updatedAt = now,
+                    syncStatus = SyncStatus.DELETED_LOCAL.raw
+                )
+                didDeleteDuplicates = true
+            }
+        }
+
+        return didDeleteDuplicates
     }
 
     

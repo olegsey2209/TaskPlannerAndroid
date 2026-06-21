@@ -41,7 +41,8 @@ class StatisticsRepository(
         val now = LocalDate.now()
         val startDate = when (period) {
             StatisticsPeriod.DAY -> now
-            StatisticsPeriod.WEEK -> now.with(TemporalAdjusters.previousOrSame(DayOfWeek.MONDAY))
+            // iOS Calendar.current в текущей конфигурации считает неделю с воскресенья.
+            StatisticsPeriod.WEEK -> now.with(TemporalAdjusters.previousOrSame(DayOfWeek.SUNDAY))
             StatisticsPeriod.MONTH -> now.withDayOfMonth(1)
             StatisticsPeriod.YEAR -> now.withDayOfYear(1)
         }
@@ -55,14 +56,14 @@ class StatisticsRepository(
         val startMillis = TimeUtils.startOfDayMillis(startDate)
         val endMillis = TimeUtils.startOfDayMillis(endExclusive)
 
-        val tasks = taskDao.getForRange(userId, startMillis, endMillis)
+        val tasks = taskDao.getVisibleForStatistics(userId, startMillis, endMillis)
         val totalTasks = tasks.size
         val completedTasks = tasks.count { it.status == TaskStatus.COMPLETED.raw }
         val completionRate = if (totalTasks > 0) completedTasks.toDouble() / totalTasks.toDouble() else 0.0
 
         val tasksByPriority = (0..2).associateWith { p -> tasks.count { it.priority == p } }
 
-        val categoriesById = categoryDao.getAll(userId).associateBy { it.id }
+        val categoriesById = categoryDao.getAllForUser(userId).associateBy { it.id }
         val tasksByCategory = buildMap<String, Int> {
             tasks.forEach { task ->
                 val name = task.categoryId?.let { categoriesById[it]?.name } ?: "Без категории"
@@ -116,4 +117,3 @@ class StatisticsRepository(
         )
     }
 }
-

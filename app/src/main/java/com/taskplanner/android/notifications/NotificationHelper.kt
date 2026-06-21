@@ -7,6 +7,7 @@ import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.os.Build
+import com.taskplanner.android.core.model.TaskStatus
 import com.taskplanner.android.data.local.entities.TaskEntity
 
 object NotificationHelper {
@@ -31,15 +32,22 @@ object NotificationHelper {
 
     fun scheduleReminder(context: Context, task: TaskEntity) {
         val startTimeMillis = task.startTime ?: return
-        if (!task.hasReminder) return
+        if (!task.hasReminder || task.deletedAt != null || task.status != TaskStatus.PLANNED.raw) {
+            cancelReminder(context, task.id)
+            return
+        }
 
         val offsetMs = task.reminderOffsetMinutes * 60_000L
         val triggerAt = startTimeMillis - offsetMs
 
-        if (triggerAt <= System.currentTimeMillis()) return
+        if (triggerAt <= System.currentTimeMillis()) {
+            cancelReminder(context, task.id)
+            return
+        }
 
         val intent = Intent(context, AlarmReceiver::class.java).apply {
             putExtra("taskId", task.id)
+            putExtra("userId", task.userId)
             putExtra("taskTitle", task.title ?: "")
             putExtra("taskDescription", task.description ?: "")
             putExtra("reminderOffsetMinutes", task.reminderOffsetMinutes)
@@ -75,5 +83,7 @@ object NotificationHelper {
         )
         val am = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
         am.cancel(pi)
+        val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        nm.cancel(taskId.hashCode())
     }
 }

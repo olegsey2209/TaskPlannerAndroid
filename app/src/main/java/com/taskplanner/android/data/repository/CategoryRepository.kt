@@ -15,6 +15,14 @@ class CategoryRepository(
         return categoryDao.observeAll(userId)
     }
 
+    fun observeForTaskFilter(userId: String): Flow<List<CategoryEntity>> {
+        return categoryDao.observeForTaskFilter(userId)
+    }
+
+    fun observeAllIncludingDeleted(userId: String): Flow<List<CategoryEntity>> {
+        return categoryDao.observeAllForUser(userId)
+    }
+
     suspend fun createCategory(userId: String, name: String, iconName: String, colorHex: String) {
         val normalizedName = name.trim()
         if (normalizedName.isEmpty()) return
@@ -75,13 +83,13 @@ class CategoryRepository(
         if (existing.isNotEmpty()) return
 
         val defaults = listOf(
-            Triple("Личное", "person", "#007AFF"),
-            Triple("Работа", "work", "#34C759"),
-            Triple("Дом", "home", "#FF9500"),
-            Triple("Учеба", "school", "#5856D6"),
-            Triple("Здоровье", "favorite", "#FF2D55"),
-            Triple("Спорт", "fitness_center", "#64D2FF"),
-            Triple("Творчество", "palette", "#FF64D2")
+            Triple("Личное", "person.fill", "#007AFF"),
+            Triple("Работа", "briefcase.fill", "#34C759"),
+            Triple("Дом", "house.fill", "#FF9500"),
+            Triple("Учеба", "book.fill", "#5856D6"),
+            Triple("Здоровье", "heart.fill", "#FF2D55"),
+            Triple("Спорт", "figure.run", "#64D2FF"),
+            Triple("Творчество", "paintpalette.fill", "#FF64D2")
         )
 
         val now = System.currentTimeMillis()

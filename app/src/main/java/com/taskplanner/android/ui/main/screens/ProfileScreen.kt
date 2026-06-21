@@ -26,13 +26,18 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.google.firebase.FirebaseNetworkException
+import com.google.firebase.auth.EmailAuthProvider
 import com.google.firebase.auth.FirebaseAuth
+import com.google.firebase.auth.FirebaseAuthInvalidCredentialsException
+import com.google.firebase.auth.FirebaseAuthRecentLoginRequiredException
 import com.taskplanner.android.data.local.entities.CategoryEntity
 import com.taskplanner.android.ui.LocalAppGraph
 import com.taskplanner.android.ui.main.profile.CategoriesViewModel
 import com.taskplanner.android.ui.theme.AccentGradient
 import com.taskplanner.android.ui.theme.AppColors
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.tasks.await
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -42,7 +47,10 @@ fun ProfileScreen(padding: PaddingValues, userId: String, onOpenCategories: () -
     val graph = LocalAppGraph.current
     val scope = rememberCoroutineScope()
 
-    val vm: CategoriesViewModel = viewModel(factory = CategoriesViewModel.Factory(userId, graph.categoryRepository))
+    val vm: CategoriesViewModel = viewModel(
+        key = "profile-categories-$userId",
+        factory = CategoriesViewModel.Factory(userId, graph.categoryRepository)
+    )
     val categories by vm.categories.collectAsState()
     val userProfile by remember(userId) { graph.observeUserProfile(userId) }.collectAsState(initial = null)
 
@@ -57,6 +65,9 @@ fun ProfileScreen(padding: PaddingValues, userId: String, onOpenCategories: () -
     var showLogoutConfirm by remember { mutableStateOf(false) }
     var showChangePassword by remember { mutableStateOf(false) }
     var showDeleteAccountConfirm by remember { mutableStateOf(false) }
+    var isDeletingAccount by remember { mutableStateOf(false) }
+    var accountError by remember { mutableStateOf<String?>(null) }
+    var deletionPassword by remember { mutableStateOf("") }
 
     Column(
         modifier = Modifier
@@ -81,8 +92,10 @@ fun ProfileScreen(padding: PaddingValues, userId: String, onOpenCategories: () -
                 }
                 Spacer(Modifier.width(14.dp))
                 Column(modifier = Modifier.weight(1f)) {
-                    val displayName = userProfile?.username?.takeIf { it.isNotBlank() }
-                        ?: userProfile?.email?.substringBefore('@') ?: "Пользователь"
+                    val profileEmail = userProfile?.email
+                    val displayName = usableProfileName(userProfile?.username, profileEmail)
+                        ?: usableProfileName(FirebaseAuth.getInstance().currentUser?.displayName, profileEmail)
+                        ?: "Пользователь"
                     Text(displayName, fontWeight = FontWeight.SemiBold, fontSize = 17.sp, color = AppColors.Label, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     if (!userProfile?.email.isNullOrBlank()) {
                         Text(userProfile?.email ?: "", color = AppColors.GrayText, fontSize = 14.sp, maxLines = 1)
@@ -100,7 +113,7 @@ fun ProfileScreen(padding: PaddingValues, userId: String, onOpenCategories: () -
                 Icon(Icons.Filled.Label, null, tint = AppColors.Blue, modifier = Modifier.size(22.dp))
                 Spacer(Modifier.width(12.dp))
                 Text("Управление категориями", fontSize = 16.sp, color = AppColors.Label, modifier = Modifier.weight(1f))
-                Icon(Icons.Filled.ChevronRight, null, tint = AppColors.GrayText, modifier = Modifier.size(20.dp))
+                Icon(Icons.Filled.ChevronRight, null, tint = AppColors.Blue, modifier = Modifier.size(20.dp))
             }
         }
 
@@ -190,7 +203,10 @@ fun ProfileScreen(padding: PaddingValues, userId: String, onOpenCategories: () -
                         }
                         Divider(color = AppColors.SeparatorLight, thickness = 0.5.dp, modifier = Modifier.padding(start = 48.dp))
                         Row(
-                            modifier = Modifier.fillMaxWidth().clickable { showDeleteAccountConfirm = true }.padding(horizontal = 16.dp, vertical = 14.dp),
+                            modifier = Modifier.fillMaxWidth().clickable {
+                                accountError = null
+                                showDeleteAccountConfirm = true
+                            }.padding(horizontal = 16.dp, vertical = 14.dp),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             Icon(Icons.Filled.Delete, null, tint = AppColors.Red, modifier = Modifier.size(20.dp))
@@ -210,19 +226,21 @@ fun ProfileScreen(padding: PaddingValues, userId: String, onOpenCategories: () -
     if (showLogoutConfirm) {
         AlertDialog(
             onDismissRequest = { showLogoutConfirm = false },
-            title = { Text("Выйти из аккаунта?") },
-            text = { Text("Вы можете снова войти в любое время.") },
+            containerColor = Color.White,
+            shape = RoundedCornerShape(24.dp),
+            title = { Text("Выйти из аккаунта?", fontWeight = FontWeight.SemiBold, color = AppColors.Label) },
+            text = { Text("Вы можете снова войти в любое время.", color = AppColors.GrayText) },
             confirmButton = {
                 TextButton(onClick = {
                     showLogoutConfirm = false
                     scope.launch {
                         FirebaseAuth.getInstance().signOut()
                         graph.setCurrentUserIdForTrigger(null)
-                        graph.userPrefs.setCurrentUserId("")
+                        graph.userPrefs.clearCurrentUserId()
                     }
-                }) { Text("Выйти", color = AppColors.Red) }
+                }) { Text("Выйти", color = AppColors.Red, fontWeight = FontWeight.SemiBold) }
             },
-            dismissButton = { TextButton(onClick = { showLogoutConfirm = false }) { Text("Отмена") } }
+            dismissButton = { TextButton(onClick = { showLogoutConfirm = false }) { Text("Отмена", color = AppColors.Blue) } }
         )
     }
     if (showChangePassword) {
@@ -233,22 +251,94 @@ fun ProfileScreen(padding: PaddingValues, userId: String, onOpenCategories: () -
 
     if (showDeleteAccountConfirm) {
         AlertDialog(
-            onDismissRequest = { showDeleteAccountConfirm = false },
-            title = { Text("Удалить аккаунт?") },
-            text = { Text("Все данные будут удалены без возможности восстановления.") },
+            onDismissRequest = {
+                if (!isDeletingAccount) {
+                    showDeleteAccountConfirm = false
+                    deletionPassword = ""
+                }
+            },
+            containerColor = Color.White,
+            shape = RoundedCornerShape(24.dp),
+            title = { Text("Удалить аккаунт?", fontWeight = FontWeight.SemiBold, color = AppColors.Label) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Text(
+                        "Введите пароль. Все данные будут удалены без возможности восстановления.",
+                        color = AppColors.GrayText
+                    )
+                    OutlinedTextField(
+                        value = deletionPassword,
+                        onValueChange = { deletionPassword = it },
+                        label = { Text("Пароль") },
+                        singleLine = true,
+                        enabled = !isDeletingAccount,
+                        visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation(),
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    accountError?.let { message ->
+                        Text(message, color = AppColors.Red, fontSize = 14.sp)
+                    }
+                }
+            },
             confirmButton = {
                 TextButton(onClick = {
-                    showDeleteAccountConfirm = false
                     scope.launch {
-                        FirebaseAuth.getInstance().currentUser?.delete()
-                        graph.setCurrentUserIdForTrigger(null)
-                        graph.userPrefs.setCurrentUserId("")
+                        val user = FirebaseAuth.getInstance().currentUser
+                        val email = user?.email
+                        if (user == null || email.isNullOrBlank()) {
+                            accountError = "Сессия завершена. Войдите в аккаунт заново."
+                            return@launch
+                        }
+
+                        isDeletingAccount = true
+                        try {
+                            val credential = EmailAuthProvider.getCredential(email, deletionPassword)
+                            user.reauthenticate(credential).await()
+                            user.delete().await()
+                            graph.clearDeletedAccountSession(userId)
+                            showDeleteAccountConfirm = false
+                            deletionPassword = ""
+                        } catch (_: FirebaseAuthRecentLoginRequiredException) {
+                            accountError = "Для удаления аккаунта нужно выйти и войти заново."
+                        } catch (_: FirebaseAuthInvalidCredentialsException) {
+                            accountError = "Неверный пароль. Проверьте его и попробуйте еще раз."
+                        } catch (_: FirebaseNetworkException) {
+                            accountError = "Проблема с сетью. Проверьте подключение и попробуйте еще раз."
+                        } catch (_: Exception) {
+                            accountError = "Не удалось удалить аккаунт. Попробуйте еще раз."
+                        } finally {
+                            isDeletingAccount = false
+                        }
                     }
-                }) { Text("Удалить", color = AppColors.Red) }
+                }, enabled = deletionPassword.isNotBlank() && !isDeletingAccount) {
+                    Text("Удалить", color = AppColors.Red, fontWeight = FontWeight.SemiBold)
+                }
             },
-            dismissButton = { TextButton(onClick = { showDeleteAccountConfirm = false }) { Text("Отмена") } }
+            dismissButton = {
+                TextButton(
+                    onClick = {
+                        showDeleteAccountConfirm = false
+                        deletionPassword = ""
+                    },
+                    enabled = !isDeletingAccount
+                ) {
+                    Text("Отмена", color = AppColors.Blue)
+                }
+            }
         )
     }
+}
+
+private fun usableProfileName(value: String?, email: String?): String? {
+    val trimmed = value?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+    val normalized = trimmed.lowercase()
+    val normalizedEmail = email?.trim()?.lowercase()
+    val emailPrefix = normalizedEmail?.substringBefore('@')
+
+    if ('@' in normalized || normalized == normalizedEmail || normalized == emailPrefix) {
+        return null
+    }
+    return trimmed
 }
 
 @Composable
@@ -295,30 +385,73 @@ private fun CategoryEditorDialog(initial: CategoryEntity?, onDismiss: () -> Unit
     val palette = listOf("#007AFF","#34C759","#FF9500","#FF3B30","#AF52DE","#FF2D55","#64D2FF","#5856D6","#FF64D2","#A1887F")
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text(if (initial == null) "Новая категория" else "Изменить категорию") },
+        containerColor = Color.White,
+        shape = RoundedCornerShape(24.dp),
+        title = {
+            Text(
+                if (initial == null) "Новая категория" else "Изменить категорию",
+                fontSize = 20.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = AppColors.Label,
+                modifier = Modifier.fillMaxWidth(),
+                textAlign = androidx.compose.ui.text.style.TextAlign.Center
+            )
+        },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                OutlinedTextField(value = name, onValueChange = { name = it }, label = { Text("Название") }, singleLine = true)
-                Text("Цвет", fontSize = 13.sp, color = AppColors.GrayText)
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    palette.take(5).forEach { hex -> ColorDot(hex, hex.equals(selectedColor, true)) { selectedColor = hex } }
+            Column(verticalArrangement = Arrangement.spacedBy(16.dp), modifier = Modifier.fillMaxWidth()) {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("Название", fontSize = 12.sp, color = AppColors.GrayText, fontWeight = FontWeight.Medium)
+                    OutlinedTextField(
+                        value = name,
+                        onValueChange = { name = it },
+                        placeholder = { Text("Название категории", color = AppColors.GrayText) },
+                        singleLine = true,
+                        shape = RoundedCornerShape(14.dp),
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedContainerColor = AppColors.SecondarySystemBackground,
+                            unfocusedContainerColor = AppColors.SecondarySystemBackground,
+                            focusedBorderColor = AppColors.Blue,
+                            unfocusedBorderColor = Color.Transparent,
+                            cursorColor = AppColors.Blue
+                        ),
+                        modifier = Modifier.fillMaxWidth()
+                    )
                 }
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    palette.drop(5).forEach { hex -> ColorDot(hex, hex.equals(selectedColor, true)) { selectedColor = hex } }
+
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text("Цвет", fontSize = 12.sp, color = AppColors.GrayText, fontWeight = FontWeight.Medium)
+                    palette.chunked(5).forEach { rowColors ->
+                        Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
+                            rowColors.forEach { hex -> ColorDot(hex, hex.equals(selectedColor, true)) { selectedColor = hex } }
+                        }
+                    }
                 }
             }
         },
         confirmButton = {
-            TextButton(onClick = { val t = name.trim(); if (t.isNotEmpty()) onSave(t, initial?.iconName ?: "tag", selectedColor) }) { Text("Сохранить") }
+            TextButton(
+                onClick = { val t = name.trim(); if (t.isNotEmpty()) onSave(t, initial?.iconName ?: "tag.fill", selectedColor) },
+                enabled = name.trim().isNotEmpty()
+            ) {
+                Text("Сохранить", color = if (name.trim().isNotEmpty()) AppColors.Blue else AppColors.GrayText, fontWeight = FontWeight.SemiBold)
+            }
         },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Отмена") } }
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Отмена", color = AppColors.Blue) } }
     )
 }
 
 @Composable
 private fun ColorDot(hex: String, selected: Boolean, onClick: () -> Unit) {
-    Box(modifier = Modifier.size(36.dp).clip(CircleShape).background(parseHex(hex)).clickable { onClick() }, contentAlignment = Alignment.Center) {
-        if (selected) Icon(Icons.Filled.CheckCircle, null, tint = Color.White, modifier = Modifier.size(20.dp))
+    Box(
+        modifier = Modifier
+            .size(42.dp)
+            .clip(CircleShape)
+            .background(parseHex(hex))
+            .border(BorderStroke(2.dp, if (selected) AppColors.Label.copy(alpha = 0.18f) else Color.Transparent), CircleShape)
+            .clickable { onClick() },
+        contentAlignment = Alignment.Center
+    ) {
+        if (selected) Icon(Icons.Filled.Check, null, tint = Color.White, modifier = Modifier.size(20.dp))
     }
 }
 

@@ -49,6 +49,7 @@ import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.DirectionsRun
 import androidx.compose.material.icons.filled.Notifications
 import androidx.compose.material.icons.filled.FilterList
 import androidx.compose.material.icons.filled.FitnessCenter
@@ -60,6 +61,7 @@ import androidx.compose.material.icons.filled.Flight
 import androidx.compose.material.icons.filled.DirectionsCar
 import androidx.compose.material.icons.filled.ShoppingCart
 import androidx.compose.material.icons.filled.List
+import androidx.compose.material.icons.filled.MenuBook
 import androidx.compose.material.icons.filled.RadioButtonUnchecked
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.KeyboardArrowUp
@@ -155,11 +157,16 @@ fun TasksScreen(
     onInitialTaskIdConsumed: () -> Unit
 ) {
     val graph = LocalAppGraph.current
-    val vm: TasksViewModel = viewModel(factory = TasksViewModel.Factory(userId, graph.taskRepository, graph.categoryRepository))
+    val vm: TasksViewModel = viewModel(
+        key = "tasks-$userId",
+        factory = TasksViewModel.Factory(userId, graph.taskRepository, graph.categoryRepository)
+    )
 
     val tasks by vm.tasks.collectAsState()
     val selectedDate by vm.selectedDate.collectAsState()
     val categories by vm.categories.collectAsState()
+    val filterCategories by vm.filterCategories.collectAsState()
+    val allCategories by vm.allCategories.collectAsState()
     val searchResults by vm.searchResults.collectAsState()
     val currentSort by vm.currentSort.collectAsState()
 
@@ -188,7 +195,7 @@ fun TasksScreen(
         if (updated != null) detailTask = updated
     }
 
-    val categoryById = remember(categories) { categories.associateBy { it.id } }
+    val categoryById = remember(allCategories) { allCategories.associateBy { it.id } }
 
     var showEditor by remember { mutableStateOf(false) }
     var editorMode: EditorMode by remember { mutableStateOf(EditorMode.Create) }
@@ -291,6 +298,15 @@ fun TasksScreen(
                                 if (s != TasksViewModel.Sort.PRIORITY_ASC)
                                     Divider(color = AppColors.SeparatorLight, thickness = 0.5.dp, modifier = Modifier.padding(horizontal = 8.dp))
                             }
+                            Divider(color = AppColors.SeparatorLight, thickness = 0.5.dp, modifier = Modifier.padding(horizontal = 8.dp))
+                            DropdownMenuItem(
+                                text = { Text("Расставить по времени", fontSize = 16.sp, color = AppColors.Label) },
+                                leadingIcon = { Icon(Icons.Filled.AccessTime, null, tint = AppColors.Blue, modifier = Modifier.size(18.dp)) },
+                                onClick = {
+                                    vm.sortCurrentDayByTime()
+                                    sortMenu = false
+                                }
+                            )
                         }
                     }
                 }
@@ -315,7 +331,7 @@ fun TasksScreen(
                 )
 
                 if (reorderList.isEmpty()) {
-                    Text("Пока нет задач", modifier = Modifier.padding(horizontal = 16.dp))
+                    TasksEmptyState(modifier = Modifier.fillMaxSize())
                 } else {
                     LazyColumn(
                         modifier = Modifier.fillMaxSize(),
@@ -339,53 +355,44 @@ fun TasksScreen(
                                         if (draggingIndex == index) translationY = dragOffsetY
                                     }
                                     .zIndex(if (draggingIndex == index) 1f else 0f)
-                                    .alpha(alpha)
-                                    .let { base ->
-                                        if (currentSort == TasksViewModel.Sort.CUSTOM) {
-                                            base.pointerInput(reorderList, draggingIndex, dragOffsetY) {
-                                                detectDragGesturesAfterLongPress(
-                                                    onDragStart = {
-                                                        isDragging = true
-                                                        draggingIndex = index
-                                                    },
-                                                    onDragCancel = {
-                                                        isDragging = false
-                                                        draggingIndex = null
-                                                        dragOffsetY = 0f
-                                                    },
-                                                    onDragEnd = {
-                                                        isDragging = false
-                                                        draggingIndex = null
-                                                        dragOffsetY = 0f
-                                                        vm.persistCustomOrder(reorderList.map { it.id })
-                                                    },
-                                                    onDrag = { change, dragAmount ->
-                                                        change.consume()
-                                                        val currentIndex = draggingIndex ?: return@detectDragGesturesAfterLongPress
-                                                        dragOffsetY += dragAmount.y
-                                                        val deltaIndex = (dragOffsetY / itemHeightPx).roundToInt()
-                                                        if (deltaIndex != 0) {
-                                                            val newIndex = (currentIndex + deltaIndex).coerceIn(0, reorderList.lastIndex)
-                                                            if (newIndex != currentIndex) {
-                                                                val mutable = reorderList.toMutableList()
-                                                                val moved = mutable.removeAt(currentIndex)
-                                                                mutable.add(newIndex, moved)
-                                                                reorderList = mutable.toList()
-                                                                draggingIndex = newIndex
-                                                                dragOffsetY -= (deltaIndex * itemHeightPx)
-                                                            }
-                                                        }
-                                                    }
-                                                )
-                                            }
-                                        } else {
-                                            base
-                                        }
-                                    },
+                                    .alpha(alpha),
                                 task = task,
                                 timeText = timeText,
                                 category = category,
                                 subtasksCount = subtasksCount,
+                                dragEnabled = currentSort == TasksViewModel.Sort.CUSTOM,
+                                onDragStart = {
+                                    isDragging = true
+                                    draggingIndex = index
+                                },
+                                onDragCancel = {
+                                    isDragging = false
+                                    draggingIndex = null
+                                    dragOffsetY = 0f
+                                },
+                                onDragEnd = {
+                                    isDragging = false
+                                    draggingIndex = null
+                                    dragOffsetY = 0f
+                                    vm.persistCustomOrder(reorderList.map { it.id })
+                                },
+                                onDrag = { dragAmountY ->
+                                    draggingIndex?.let { currentIndex ->
+                                        dragOffsetY += dragAmountY
+                                        val deltaIndex = (dragOffsetY / itemHeightPx).roundToInt()
+                                        if (deltaIndex != 0) {
+                                            val newIndex = (currentIndex + deltaIndex).coerceIn(0, reorderList.lastIndex)
+                                            if (newIndex != currentIndex) {
+                                                val mutable = reorderList.toMutableList()
+                                                val moved = mutable.removeAt(currentIndex)
+                                                mutable.add(newIndex, moved)
+                                                reorderList = mutable.toList()
+                                                draggingIndex = newIndex
+                                                dragOffsetY -= (deltaIndex * itemHeightPx)
+                                            }
+                                        }
+                                    }
+                                },
                                 onToggleCompleted = { vm.toggleCompletion(task.id) },
                                 onClick = { detailTask = task }
                             )
@@ -480,7 +487,7 @@ fun TasksScreen(
 
     if (showCategoryFilter) {
         CategoryFilterSheet(
-            categories = categories,
+            categories = filterCategories,
             selectedIds = categoryFilter,
             onToggle = { vm.toggleCategoryFilter(it) },
             onClear = { vm.clearCategoryFilter() },
@@ -516,6 +523,37 @@ private data class TaskEditorData(
     val hasReminder: Boolean,
     val reminderOffsetMinutes: Int
 )
+
+@Composable
+private fun TasksEmptyState(modifier: Modifier = Modifier) {
+    Column(
+        modifier = modifier
+            .padding(horizontal = 24.dp)
+            .padding(bottom = 72.dp),
+        verticalArrangement = Arrangement.Center,
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Icon(
+            imageVector = Icons.Filled.List,
+            contentDescription = null,
+            tint = Color.Gray.copy(alpha = 0.32f),
+            modifier = Modifier.size(72.dp)
+        )
+        Spacer(modifier = Modifier.height(16.dp))
+        Text(
+            "Здесь пока пусто :(",
+            style = MaterialTheme.typography.titleMedium,
+            color = Color.Gray
+        )
+        Spacer(modifier = Modifier.height(6.dp))
+        Text(
+            "Нажмите на + как только у вас появится задача",
+            style = MaterialTheme.typography.bodySmall,
+            color = Color.Gray.copy(alpha = 0.75f),
+            textAlign = TextAlign.Center
+        )
+    }
+}
 
 @Composable
 private fun IosRoundIconButton(
@@ -623,7 +661,7 @@ private fun SearchBar(vm: TasksViewModel, modifier: Modifier = Modifier) {
     var periodEnabled by remember { mutableStateOf(false) }
 
     Column(
-        modifier = modifier.padding(horizontal = 16.dp),
+        modifier = modifier,
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
         
@@ -695,7 +733,11 @@ private fun SearchResults(results: List<TaskEntity>, searchQuery: String, onSele
         return
     }
     
-    Column(modifier = Modifier.padding(horizontal = 16.dp)) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp)
+    ) {
         Text("РЕЗУЛЬТАТЫ", fontSize = 12.sp, color = AppColors.GrayText,
             modifier = Modifier.padding(start = 4.dp, bottom = 6.dp))
         Box(
@@ -737,6 +779,11 @@ private fun TaskCard(
     timeText: String?,
     category: CategoryEntity?,
     subtasksCount: Int?,
+    dragEnabled: Boolean,
+    onDragStart: () -> Unit,
+    onDragCancel: () -> Unit,
+    onDragEnd: () -> Unit,
+    onDrag: (Float) -> Unit,
     onToggleCompleted: () -> Unit,
     onClick: () -> Unit
 ) {
@@ -748,6 +795,23 @@ private fun TaskCard(
         modifier = modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(14.dp))
+            .let { base ->
+                if (dragEnabled) {
+                    base.pointerInput(task.id) {
+                        detectDragGesturesAfterLongPress(
+                            onDragStart = { onDragStart() },
+                            onDragCancel = onDragCancel,
+                            onDragEnd = onDragEnd,
+                            onDrag = { change, dragAmount ->
+                                change.consume()
+                                onDrag(dragAmount.y)
+                            }
+                        )
+                    }
+                } else {
+                    base
+                }
+            }
             .clickable { onClick() },
         shape = RoundedCornerShape(14.dp),
         color = containerColor,
@@ -1184,9 +1248,9 @@ private val SF_TO_MATERIAL: Map<String, androidx.compose.ui.graphics.vector.Imag
     "person.fill" to Icons.Filled.Person,
     "briefcase.fill" to Icons.Filled.Work,
     "house.fill" to Icons.Filled.Home,
-    "book.fill" to Icons.Filled.School,
+    "book.fill" to Icons.Filled.MenuBook,
     "heart.fill" to Icons.Filled.Favorite,
-    "figure.run" to Icons.Filled.FitnessCenter,
+    "figure.run" to Icons.Filled.DirectionsRun,
     "paintpalette.fill" to Icons.Filled.Palette,
     "cart.fill" to Icons.Filled.ShoppingCart,
     "car.fill" to Icons.Filled.DirectionsCar,
@@ -1264,9 +1328,11 @@ private fun TaskEditorBottomSheet(
         onDismissRequest = onDismiss,
         sheetState = sheetState,
         containerColor = AppColors.SystemGroupedBackground,
+        dragHandle = null,
+        windowInsets = androidx.compose.foundation.layout.WindowInsets(0, 0, 0, 0),
         modifier = Modifier.fillMaxHeight(0.94f)
     ) {
-        Column(modifier = Modifier.fillMaxSize()) {
+        Column(modifier = Modifier.fillMaxSize().statusBarsPadding().padding(bottom = 12.dp)) {
             
             Row(
                 modifier = Modifier
@@ -1303,7 +1369,7 @@ private fun TaskEditorBottomSheet(
                                 removeImage = imageRemoved,
                                 priority = priority,
                                 categoryId = categoryId,
-                                startTime = if (showingTime) startTime else null,
+                                startTime = if (showingTime) startTime ?: LocalTime.of(9, 0) else null,
                                 hasReminder = hasReminder && showingTime,
                                 reminderOffsetMinutes = reminderOffset
                             )
@@ -1506,27 +1572,10 @@ private fun TaskEditorBottomSheet(
                     }
                     if (hasReminder && showingTime) {
                         IosThinDivider()
-                        val options = listOf(0, 5, 10, 15, 30, 60)
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            options.forEach { opt ->
-                                val sel = reminderOffset == opt
-                                Box(
-                                    modifier = Modifier
-                                        .clip(RoundedCornerShape(10.dp))
-                                        .background(if (sel) AppColors.Blue.copy(alpha = 0.12f) else Color.Transparent)
-                                        .clickable { reminderOffset = opt }
-                                        .padding(horizontal = 10.dp, vertical = 6.dp)
-                                ) {
-                                    val label = if (opt == 0) "В момент" else "${opt} мин"
-                                    Text(
-                                        label,
-                                        color = if (sel) AppColors.Blue else AppColors.GrayText,
-                                        fontSize = 13.sp,
-                                        fontWeight = if (sel) FontWeight.SemiBold else FontWeight.Normal
-                                    )
-                                }
-                            }
-                        }
+                        ReminderOffsetChips(
+                            selected = reminderOffset,
+                            onSelected = { reminderOffset = it }
+                        )
                     }
                 }
 
@@ -1571,9 +1620,9 @@ private fun SectionCard(title: String, content: @Composable ColumnScope.() -> Un
         Box(
             modifier = Modifier
                 .fillMaxWidth()
-                .clip(RoundedCornerShape(12.dp))
+                .clip(RoundedCornerShape(14.dp))
                 .background(Color(0xFFFFFFFF))
-                .border(BorderStroke(1.dp, Color(0xFFE0E0E0)), RoundedCornerShape(12.dp))
+                .border(BorderStroke(0.5.dp, AppColors.SeparatorLight), RoundedCornerShape(14.dp))
         ) {
             Column(
                 modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp),
@@ -1612,6 +1661,38 @@ private fun IosTextFieldRow(
 @Composable
 private fun IosThinDivider() {
     Box(modifier = Modifier.fillMaxWidth().height(0.5.dp).background(AppColors.SeparatorLight))
+}
+
+@Composable
+private fun ReminderOffsetChips(selected: Int, onSelected: (Int) -> Unit) {
+    var expanded by remember { mutableStateOf(false) }
+    fun label(minutes: Int) = if (minutes == 0) "В момент" else "${minutes} мин"
+
+    Box {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable { expanded = true }
+                .padding(top = 10.dp, bottom = 6.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text("Когда напомнить", modifier = Modifier.weight(1f), fontSize = 16.sp, color = AppColors.Label)
+            Text(label(selected), color = AppColors.Blue, fontSize = 16.sp, fontWeight = FontWeight.Medium)
+            Icon(Icons.Filled.ArrowDropDown, null, tint = AppColors.Blue, modifier = Modifier.size(18.dp))
+        }
+        IosDropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+            listOf(0, 5, 10, 15, 30, 60).forEach { minutes ->
+                IosMenuItem(
+                    label(minutes),
+                    Icons.Filled.Notifications,
+                    if (selected == minutes) AppColors.Blue else AppColors.Label
+                ) {
+                    onSelected(minutes)
+                    expanded = false
+                }
+            }
+        }
+    }
 }
 
 @Composable
@@ -1668,11 +1749,22 @@ private fun CalendarDialog(
     var currentMonth by remember { mutableStateOf(YearMonth.from(selectedDate)) }
     val today = remember { LocalDate.now() }
 
-    val monthTasksRaw by rememberUpdatedState(tasks)
+    LaunchedEffect(Unit) {
+        onMonthChanged(currentMonth)
+    }
 
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Календарь") },
+        containerColor = Color.White,
+        shape = RoundedCornerShape(20.dp),
+        title = {
+            Text(
+                "Календарь",
+                modifier = Modifier.fillMaxWidth(),
+                textAlign = TextAlign.Center,
+                fontWeight = FontWeight.SemiBold
+            )
+        },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 Row(
@@ -1680,12 +1772,17 @@ private fun CalendarDialog(
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    IconButton(onClick = { currentMonth = currentMonth.minusMonths(1); onMonthChanged(currentMonth) }, modifier = Modifier.size(40.dp)) { Text("←", fontSize = 22.sp, fontWeight = FontWeight.Bold, color = AppColors.Blue) }
+                    IconButton(onClick = { currentMonth = currentMonth.minusMonths(1); onMonthChanged(currentMonth) }, modifier = Modifier.size(40.dp)) {
+                        Icon(Icons.Filled.ChevronLeft, contentDescription = "Предыдущий месяц", tint = AppColors.Blue)
+                    }
                     Text(
                         text = "${currentMonth.month.getDisplayName(TextStyle.FULL_STANDALONE, Locale("ru")).replaceFirstChar { it.uppercase() }} ${currentMonth.year}",
-                        style = MaterialTheme.typography.titleMedium
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold
                     )
-                    IconButton(onClick = { currentMonth = currentMonth.plusMonths(1); onMonthChanged(currentMonth) }, modifier = Modifier.size(40.dp)) { Text("→", fontSize = 22.sp, fontWeight = FontWeight.Bold, color = AppColors.Blue) }
+                    IconButton(onClick = { currentMonth = currentMonth.plusMonths(1); onMonthChanged(currentMonth) }, modifier = Modifier.size(40.dp)) {
+                        Icon(Icons.Filled.ChevronRight, contentDescription = "Следующий месяц", tint = AppColors.Blue)
+                    }
                 }
 
                 Row(modifier = Modifier.fillMaxWidth()) {
@@ -1695,7 +1792,9 @@ private fun CalendarDialog(
                             style = MaterialTheme.typography.labelSmall,
                             color = AppColors.GrayText,
                             modifier = Modifier.weight(1f),
-                            maxLines = 1
+                            maxLines = 1,
+                            textAlign = TextAlign.Center,
+                            fontWeight = FontWeight.SemiBold
                         )
                     }
                 }
@@ -1708,25 +1807,22 @@ private fun CalendarDialog(
                 }
 
                 
-                val taskCountByDate = remember(monthTasksRaw, currentMonth) {
-                    monthTasksRaw
-                        .filter { it.deletedAt == null }
+                val taskCountByDate = remember(tasks, currentMonth) {
+                    tasks
+                        .filter { it.deletedAt == null && it.parentTaskId == null }
                         .groupBy { TimeUtils.localDateFromMillis(it.date) }
-                        .mapValues { (_, tasks) ->
-                            // Считаем родительские задачи + подзадачи
-                            tasks.size
-                        }
+                        .mapValues { (_, dayTasks) -> dayTasks.size }
                 }
 
                 LazyVerticalGrid(
                     columns = GridCells.Fixed(7),
                     verticalArrangement = Arrangement.spacedBy(4.dp),
                     horizontalArrangement = Arrangement.spacedBy(4.dp),
-                    modifier = Modifier.height(320.dp)
+                    modifier = Modifier.height(360.dp)
                 ) {
                     items(days) { day ->
                         if (day == null) {
-                            Spacer(modifier = Modifier.height(44.dp))
+                            Spacer(modifier = Modifier.height(56.dp))
                         } else {
                             val isSelected = day == selectedDate
                             val isToday = day == today
@@ -1745,29 +1841,38 @@ private fun CalendarDialog(
                             Column(
                                 horizontalAlignment = Alignment.CenterHorizontally,
                                 modifier = Modifier
-                                    .height(48.dp)
+                                    .height(56.dp)
                                     .fillMaxWidth()
-                                    .clip(RoundedCornerShape(10.dp))
-                                    .background(bg)
                                     .clickable {
                                         onSelect(day)
                                         onDismiss()
                                     }
-                                    .padding(vertical = 4.dp)
                             ) {
-                                Text(
-                                    text = day.dayOfMonth.toString(),
-                                    color = fg,
-                                    style = MaterialTheme.typography.bodyMedium,
-                                    fontWeight = if (isSelected || isToday) FontWeight.SemiBold else FontWeight.Normal
-                                )
+                                Box(
+                                    modifier = Modifier
+                                        .size(40.dp)
+                                        .clip(CircleShape)
+                                        .background(bg),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Text(
+                                        text = day.dayOfMonth.toString(),
+                                        color = fg,
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        fontWeight = if (isSelected || isToday) FontWeight.Bold else FontWeight.Normal
+                                    )
+                                }
                                 if (taskCount > 0) {
                                     Text(
                                         text = taskCount.toString(),
                                         fontSize = 9.sp,
-                                        color = if (isSelected) Color.White.copy(alpha = 0.8f) else AppColors.Blue,
+                                        color = Color.White,
                                         lineHeight = 10.sp,
-                                        fontWeight = FontWeight.Medium
+                                        fontWeight = FontWeight.SemiBold,
+                                        modifier = Modifier
+                                            .clip(RoundedCornerShape(10.dp))
+                                            .background(AppColors.Blue)
+                                            .padding(horizontal = 5.dp, vertical = 1.dp)
                                     )
                                 }
                             }

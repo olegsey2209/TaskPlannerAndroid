@@ -24,5 +24,10 @@ class UserPrefs(private val context: Context) {
             prefs[keyCurrentUserId] = userId
         }
     }
-}
 
+    suspend fun clearCurrentUserId() {
+        context.dataStore.edit { prefs ->
+            prefs.remove(keyCurrentUserId)
+        }
+    }
+}

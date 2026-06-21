@@ -75,6 +75,12 @@ class GoalsViewModel(
         }
     }
 
+    fun reorderSteps(goalId: String, orderedStepIds: List<String>) {
+        viewModelScope.launch {
+            goalRepository.reorderSteps(userId, goalId, orderedStepIds)
+        }
+    }
+
     fun deleteStep(stepId: String) {
         viewModelScope.launch {
             goalRepository.softDeleteStep(userId, stepId)

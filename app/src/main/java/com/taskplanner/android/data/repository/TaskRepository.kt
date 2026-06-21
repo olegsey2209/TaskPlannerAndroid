@@ -5,6 +5,7 @@ import com.taskplanner.android.core.model.SyncStatus
 import com.taskplanner.android.core.model.TaskOriginType
 import com.taskplanner.android.core.model.TaskPriority
 import com.taskplanner.android.core.model.TaskStatus
+import com.taskplanner.android.core.util.AppLimits
 import com.taskplanner.android.core.util.TimeUtils
 import com.taskplanner.android.data.local.dao.GoalDao
 import com.taskplanner.android.data.local.dao.GoalStepDao
@@ -46,7 +47,13 @@ class TaskRepository(
     fun observeTasksForMonth(userId: String, yearMonth: java.time.YearMonth): Flow<List<TaskEntity>> {
         val start = TimeUtils.startOfDayMillis(yearMonth.atDay(1))
         val end = TimeUtils.startOfDayMillis(yearMonth.plusMonths(1).atDay(1))
-        return taskDao.observeForDay(userId, startInclusive = start, endExclusive = end)
+        return combine(
+            taskDao.observeForDay(userId, startInclusive = start, endExclusive = end),
+            recurrenceRuleDao.observeAll(userId)
+        ) { tasks, rules ->
+            val sourceIds = rules.map { it.sourceTaskId }.toSet()
+            tasks.filterNot { it.id in sourceIds }
+        }
     }
 
     suspend fun countSubtasks(userId: String, parentTaskId: String): Int {
@@ -77,8 +84,10 @@ class TaskRepository(
             val max = taskDao.getMaxPositionForParent(userId, parentTaskId) ?: -1
             max + 1
         } else {
-            val min = taskDao.getMinPositionForDay(userId, startOfDay, TimeUtils.startOfDayMillis(date.plusDays(1))) ?: 0
-            min - 1
+            val endOfDay = TimeUtils.startOfDayMillis(date.plusDays(1))
+            if (taskDao.countTopLevelForDay(userId, startOfDay, endOfDay) >= AppLimits.MAX_TASKS_PER_DAY) return
+            val max = taskDao.getMaxPositionForDay(userId, startOfDay, endOfDay) ?: -1
+            max + 1
         }
         val searchText = (normalizedTitle + " " + (description ?: "")).lowercase()
 
@@ -112,6 +121,9 @@ class TaskRepository(
             syncStatus = SyncStatus.CREATED_LOCAL.raw
         )
         taskDao.upsert(task)
+        if (parentTaskId == null && startTime != null) {
+            sortTasksByTime(userId, listOf(date), triggerSync = false)
+        }
         context?.let { ctx -> if (hasReminder) NotificationHelper.scheduleReminder(ctx, task) }
         syncTrigger.trigger()
     }
@@ -131,21 +143,24 @@ class TaskRepository(
         reminderOffsetMinutes: Int
     ) {
         val task = taskDao.getById(userId, taskId) ?: return
+        val oldDate = TimeUtils.localDateFromMillis(task.date)
+        val oldStartTime = task.startTime
         if (task.parentTaskId == null) {
-            val existingDate = TimeUtils.localDateFromMillis(task.date)
-            if (existingDate != date) {
+            if (oldDate != date) {
+                if (!canAddTopLevelTask(userId, date)) return
                 moveTaskToDate(userId, taskId, date)
             }
         }
+        val currentTask = taskDao.getById(userId, taskId) ?: task
         val normalizedTitle = title.trim()
         if (normalizedTitle.isEmpty()) return
 
-        val persistedDate = TimeUtils.localDateFromMillis(taskDao.getById(userId, taskId)?.date ?: task.date)
+        val persistedDate = TimeUtils.localDateFromMillis(currentTask.date)
         val now = System.currentTimeMillis()
-        val updated = task.copy(
+        val updated = currentTask.copy(
             title = normalizedTitle,
             description = description?.takeIf { it.isNotBlank() },
-            imageData = when { removeImage -> null; imageData != null -> imageData; else -> task.imageData },
+            imageData = when { removeImage -> null; imageData != null -> imageData; else -> currentTask.imageData },
             priority = priority.raw,
             categoryId = categoryId,
             startTime = startTime?.let { TimeUtils.millisFromLocalTime(it, persistedDate) },
@@ -159,6 +174,9 @@ class TaskRepository(
         context?.let { ctx ->
             NotificationHelper.cancelReminder(ctx, taskId)
             if (updated.hasReminder) NotificationHelper.scheduleReminder(ctx, updated)
+        }
+        if (updated.parentTaskId == null && (oldDate != persistedDate || oldStartTime != updated.startTime)) {
+            sortTasksByTime(userId, listOf(oldDate, persistedDate), triggerSync = false)
         }
         syncTrigger.trigger()
     }
@@ -199,6 +217,13 @@ class TaskRepository(
             syncStatus = SyncStatus.UPDATED_LOCAL.raw
         )
         taskDao.update(updated)
+        context?.let { ctx ->
+            if (willComplete) {
+                NotificationHelper.cancelReminder(ctx, taskId)
+            } else if (updated.hasReminder) {
+                NotificationHelper.scheduleReminder(ctx, updated)
+            }
+        }
 
         if (task.goalStepId != null) {
             updateGoalStepCompletionFromLinkedTask(userId, goalStepId = task.goalStepId, isCompleted = willComplete, now = now)
@@ -233,14 +258,20 @@ class TaskRepository(
             val isTaskCompleted = linked.status == TaskStatus.COMPLETED.raw
             if (shouldBeCompleted == isTaskCompleted) return@forEach
 
-            taskDao.update(
-                linked.copy(
+            val updatedLinked = linked.copy(
                     status = if (shouldBeCompleted) TaskStatus.COMPLETED.raw else TaskStatus.PLANNED.raw,
                     completedAt = if (shouldBeCompleted) now else null,
                     updatedAt = now,
                     syncStatus = SyncStatus.UPDATED_LOCAL.raw
                 )
-            )
+            taskDao.update(updatedLinked)
+            context?.let { ctx ->
+                if (shouldBeCompleted) {
+                    NotificationHelper.cancelReminder(ctx, linked.id)
+                } else if (updatedLinked.hasReminder) {
+                    NotificationHelper.scheduleReminder(ctx, updatedLinked)
+                }
+            }
         }
 
         updateGoalProgress(userId, step.goalId, now)
@@ -284,27 +315,46 @@ class TaskRepository(
             syncStatus = SyncStatus.UPDATED_LOCAL.raw
         )
         taskDao.update(updated)
+        context?.let { ctx ->
+            if (shouldBeCompleted) {
+                NotificationHelper.cancelReminder(ctx, parent.id)
+            } else if (updated.hasReminder) {
+                NotificationHelper.scheduleReminder(ctx, updated)
+            }
+        }
     }
 
     suspend fun moveTaskToDate(userId: String, taskId: String, newDate: LocalDate) {
         val task = taskDao.getById(userId, taskId) ?: return
         val now = System.currentTimeMillis()
         val newDayMillis = TimeUtils.startOfDayMillis(newDate)
+        if (task.parentTaskId == null && TimeUtils.localDateFromMillis(task.date) != newDate && !canAddTopLevelTask(userId, newDate)) {
+            return
+        }
         taskDao.updateDate(userId, taskId, newDayMillis, now, SyncStatus.UPDATED_LOCAL.raw)
 
         if (task.parentTaskId == null) {
             val start = newDayMillis
             val end = TimeUtils.startOfDayMillis(newDate.plusDays(1))
-            val minPosition = taskDao.getMinPositionForDay(userId, start, end) ?: 0
-            taskDao.updatePosition(userId, taskId, minPosition - 1, now, SyncStatus.UPDATED_LOCAL.raw)
+            val maxPosition = taskDao.getMaxPositionForDay(userId, start, end) ?: -1
+            taskDao.updatePosition(userId, taskId, maxPosition + 1, now, SyncStatus.UPDATED_LOCAL.raw)
 
             val subtasks = taskDao.getSubtasks(userId, taskId).filter { it.deletedAt == null }
             subtasks.forEach { sub ->
                 taskDao.updateDate(userId, sub.id, newDayMillis, now, SyncStatus.UPDATED_LOCAL.raw)
             }
             updateParentCompletionFromSubtasks(userId, taskId)
+            if (task.startTime != null) {
+                sortTasksByTime(userId, listOf(newDate), triggerSync = false)
+            }
         }
         syncTrigger.trigger()
+    }
+
+    private suspend fun canAddTopLevelTask(userId: String, date: LocalDate): Boolean {
+        val start = TimeUtils.startOfDayMillis(date)
+        val end = TimeUtils.startOfDayMillis(date.plusDays(1))
+        return taskDao.countTopLevelForDay(userId, start, end) < AppLimits.MAX_TASKS_PER_DAY
     }
 
     suspend fun softDeleteTask(userId: String, taskId: String) {
@@ -326,6 +376,63 @@ class TaskRepository(
         val now = System.currentTimeMillis()
         taskDao.updatePositionsBatch(userId, orderedTaskIds, now, SyncStatus.UPDATED_LOCAL.raw)
         syncTrigger.trigger()
+    }
+
+    suspend fun sortTasksByTime(userId: String, date: LocalDate) {
+        sortTasksByTime(userId, listOf(date), triggerSync = true)
+    }
+
+    private suspend fun sortTasksByTime(userId: String, dates: List<LocalDate>, triggerSync: Boolean) {
+        val uniqueDates = dates.distinct()
+        if (uniqueDates.isEmpty()) return
+
+        val sourceIds = recurrenceRuleDao.getAllForUser(userId)
+            .filter { it.deletedAt == null }
+            .map { it.sourceTaskId }
+            .filter { it.isNotBlank() }
+            .toSet()
+
+        var didChange = false
+        val now = System.currentTimeMillis()
+
+        for (date in uniqueDates) {
+            val start = TimeUtils.startOfDayMillis(date)
+            val end = TimeUtils.startOfDayMillis(date.plusDays(1))
+            val ordered = taskDao.getTopLevelForDay(userId, start, end)
+                .filterNot { it.id in sourceIds }
+                .sortedWith(
+                    compareBy<TaskEntity> { timeSortKey(it) ?: Int.MAX_VALUE }
+                        .thenBy { it.position }
+                        .thenByDescending { it.createdAt }
+                        .thenBy { it.id }
+                )
+
+            ordered.forEachIndexed { index, task ->
+                if (task.position == index) return@forEachIndexed
+                taskDao.upsert(
+                    task.copy(
+                        position = index,
+                        updatedAt = now,
+                        syncStatus = localUpdateStatus(task.syncStatus)
+                    )
+                )
+                didChange = true
+            }
+        }
+
+        if (didChange && triggerSync) {
+            syncTrigger.trigger()
+        }
+    }
+
+    private fun timeSortKey(task: TaskEntity): Int? {
+        val millis = task.startTime ?: return null
+        val time = TimeUtils.localTimeFromMillis(millis)
+        return time.hour * 60 + time.minute
+    }
+
+    private fun localUpdateStatus(current: Int): Int {
+        return if (current == SyncStatus.SYNCED.raw) SyncStatus.UPDATED_LOCAL.raw else current
     }
 
     suspend fun searchTasksByTitleInRange(userId: String, query: String, from: LocalDate, toExclusive: LocalDate, limit: Int = 200): List<TaskEntity> {

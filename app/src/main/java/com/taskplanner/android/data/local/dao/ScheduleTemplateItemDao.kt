@@ -59,6 +59,17 @@ interface ScheduleTemplateItemDao {
     @Query(
         """
         UPDATE schedule_template_items
+        SET categoryId = :newCategoryId, updatedAt = :updatedAt, syncStatus = :syncStatus
+        WHERE userId = :userId
+          AND categoryId = :oldCategoryId
+          AND deletedAt IS NULL
+        """
+    )
+    suspend fun replaceCategoryId(userId: String, oldCategoryId: String, newCategoryId: String, updatedAt: Long, syncStatus: Int)
+
+    @Query(
+        """
+        UPDATE schedule_template_items
         SET deletedAt = :deletedAt, updatedAt = :updatedAt, syncStatus = :syncStatus
         WHERE userId = :userId AND templateId = :templateId AND deletedAt IS NULL
         """

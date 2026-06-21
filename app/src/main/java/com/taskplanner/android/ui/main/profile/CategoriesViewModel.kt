@@ -19,7 +19,7 @@ class CategoriesViewModel(
         categoryRepository.observeAll(userId)
             .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
-    fun createCategory(name: String, iconName: String = "tag", colorHex: String = "#007AFF") {
+    fun createCategory(name: String, iconName: String = "tag.fill", colorHex: String = "#007AFF") {
         viewModelScope.launch {
             categoryRepository.createCategory(
                 userId = userId,

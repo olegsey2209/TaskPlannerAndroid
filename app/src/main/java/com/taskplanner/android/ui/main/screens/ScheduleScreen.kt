@@ -21,7 +21,9 @@ import androidx.compose.material.icons.filled.Label
 import androidx.compose.material.icons.filled.SportsEsports
 import androidx.compose.material.icons.filled.Flight
 import androidx.compose.material.icons.filled.DirectionsCar
+import androidx.compose.material.icons.filled.DirectionsRun
 import androidx.compose.material.icons.filled.ShoppingCart
+import androidx.compose.material.icons.filled.MenuBook
 import androidx.compose.material.icons.filled.Palette
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.School
@@ -46,6 +48,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.ExpandLess
@@ -105,6 +108,7 @@ import com.taskplanner.android.data.local.entities.TaskEntity
 import com.taskplanner.android.data.local.entities.TemplateApplicationEntity
 import com.taskplanner.android.ui.LocalAppGraph
 import com.taskplanner.android.ui.main.schedule.RecurrenceSortOption
+import kotlinx.coroutines.flow.collect
 import com.taskplanner.android.ui.main.schedule.ScheduleSegment
 import com.taskplanner.android.ui.main.schedule.ScheduleViewModel
 import com.taskplanner.android.ui.main.schedule.RecurrenceSeriesUi
@@ -123,7 +127,10 @@ import java.util.UUID
 @OptIn(ExperimentalMaterial3Api::class)
 fun ScheduleScreen(padding: PaddingValues, userId: String) {
     val graph = LocalAppGraph.current
-    val vm: ScheduleViewModel = viewModel(factory = ScheduleViewModel.Factory(userId, graph.templateRepository, graph.recurrenceRepository))
+    val vm: ScheduleViewModel = viewModel(
+        key = "schedule-$userId",
+        factory = ScheduleViewModel.Factory(userId, graph.templateRepository, graph.recurrenceRepository)
+    )
 
     val segment by vm.segment.collectAsState()
     val query by vm.searchQuery.collectAsState()
@@ -132,6 +139,7 @@ fun ScheduleScreen(padding: PaddingValues, userId: String) {
     val templates by vm.filteredTemplates.collectAsState()
     val recurrence by vm.filteredRecurrenceSeries.collectAsState()
     val categories by graph.categoryRepository.observeAll(userId).collectAsState(initial = emptyList())
+    val allCategories by graph.categoryRepository.observeAllIncludingDeleted(userId).collectAsState(initial = emptyList())
 
     var showTemplateEditor by remember { mutableStateOf(false) }
     var editingTemplate by remember { mutableStateOf<ScheduleTemplateEntity?>(null) }
@@ -205,7 +213,7 @@ fun ScheduleScreen(padding: PaddingValues, userId: String) {
                                 task = item.task,
                                 rule = item.rule,
                                 isActive = item.isActive,
-                                categories = categories,
+                                categories = allCategories,
                                 onEdit = { editingRuleUi = item; showRecurrenceEditor = true },
                                 onRequestStop = { pendingStop = item.rule },
                                 onResume = { vm.resumeRecurrence(item.rule.id) },
@@ -236,25 +244,53 @@ fun ScheduleScreen(padding: PaddingValues, userId: String) {
     }
 
     if (showTemplateEditor) {
-        val initialItems = editingTemplate?.let { template ->
-            vm.observeTemplateItems(template.id).collectAsState(initial = emptyList()).value
-        } ?: emptyList()
-
-        TemplateEditorBottomSheet(
-            template = editingTemplate,
-            initialItems = initialItems,
-            categories = categories,
-            onDismiss = { showTemplateEditor = false },
-            onSave = { title, description, items ->
-                vm.saveTemplateWithItems(
-                    templateId = editingTemplate?.id,
-                    title = title,
-                    description = description,
-                    items = items
-                )
-                showTemplateEditor = false
+        val templateBeingEdited = editingTemplate
+        if (templateBeingEdited == null) {
+            TemplateEditorBottomSheet(
+                template = null,
+                initialItems = emptyList(),
+                categories = categories,
+                onDismiss = { showTemplateEditor = false },
+                onSave = { title, description, items ->
+                    vm.saveTemplateWithItems(
+                        templateId = null,
+                        title = title,
+                        description = description,
+                        items = items
+                    )
+                    showTemplateEditor = false
+                }
+            )
+        } else {
+            val loadedItems by produceState<List<ScheduleTemplateItemEntity>?>(
+                initialValue = null,
+                key1 = templateBeingEdited.id
+            ) {
+                vm.observeTemplateItems(templateBeingEdited.id).collect { value = it }
             }
-        )
+            loadedItems?.let { items ->
+                val editorKey = items.joinToString("|", prefix = templateBeingEdited.id) {
+                    "${it.id}:${it.updatedAt}:${it.title}:${it.description.orEmpty()}"
+                }
+                androidx.compose.runtime.key(editorKey) {
+                    TemplateEditorBottomSheet(
+                        template = templateBeingEdited,
+                        initialItems = items,
+                        categories = categories,
+                        onDismiss = { showTemplateEditor = false },
+                        onSave = { title, description, editedItems ->
+                            vm.saveTemplateWithItems(
+                                templateId = templateBeingEdited.id,
+                                title = title,
+                                description = description,
+                                items = editedItems
+                            )
+                            showTemplateEditor = false
+                        }
+                    )
+                }
+            }
+        }
     }
 
     showApplyTemplate?.let { template ->
@@ -281,6 +317,8 @@ fun ScheduleScreen(padding: PaddingValues, userId: String) {
         TemplateApplicationsBottomSheet(
             onDismiss = { showTemplateApplications = null },
             applicationsFlow = { vm.observeTemplateApplications(template.id) },
+            tasksFlow = { applicationId -> vm.observeTemplateApplicationTasks(applicationId) },
+            categories = allCategories,
             loadTaskCount = { applicationId -> graph.templateRepository.countTasksForApplication(userId, applicationId) },
             onDeleteApplication = { applicationId -> vm.deleteTemplateApplication(applicationId) }
         )
@@ -532,12 +570,17 @@ private fun TemplateCard(
     var menuExpanded by remember(template.id) { mutableStateOf(false) }
 
     
-    val allItems by itemsFlow().collectAsState(initial = emptyList())
+    val loadedItems by itemsFlow().collectAsState(initial = emptyList())
+    val allItems = remember(loadedItems) {
+        loadedItems
+            .filter { it.deletedAt == null }
+            .sortedWith(templateItemComparator())
+    }
 
     val items = if (expanded) allItems else emptyList()
 
     val stripeColors = remember(allItems) {
-        val priorities = allItems.filter { it.deletedAt == null }.map {
+        val priorities = allItems.map {
             when (it.priority) {
                 TaskPriority.HIGH.raw -> AppColors.Red
                 TaskPriority.LOW.raw -> AppColors.Green
@@ -560,12 +603,18 @@ private fun TemplateCard(
                 .fillMaxWidth()
                 .border(BorderStroke(0.5.dp, AppColors.SeparatorLight), RoundedCornerShape(16.dp))
         ) {
-            Row(modifier = Modifier.fillMaxWidth().height(IntrinsicSize.Min)) {
-                
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(IntrinsicSize.Min)
+                    .padding(start = 10.dp)
+            ) {
                 Box(
                     modifier = Modifier
                         .width(4.dp)
                         .fillMaxHeight()
+                        .padding(vertical = 10.dp)
+                        .clip(RoundedCornerShape(99.dp))
                         .background(
                             brush = androidx.compose.ui.graphics.Brush.verticalGradient(
                                 colors = stripeColors
@@ -630,15 +679,7 @@ private fun TemplateCard(
                     exit = fadeOut() + shrinkVertically()
                 ) {
                     Column(modifier = Modifier.padding(top = 8.dp)) {
-                        items.take(5).forEach { item -> TemplateItemRow(item) }
-                        if (itemCount > 5) {
-                            Text(
-                                text = "и ещё ${itemCount - 5}…",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = AppColors.GrayText,
-                                modifier = Modifier.padding(top = 4.dp)
-                            )
-                        }
+                        items.forEach { item -> TemplateItemRow(item) }
                     }
                 }
 
@@ -685,6 +726,12 @@ private fun TemplateCard(
         } 
     } 
 }
+
+private fun templateItemComparator(): Comparator<ScheduleTemplateItemEntity> =
+    compareBy<ScheduleTemplateItemEntity> { it.weekday }
+        .thenBy { it.startTime ?: Long.MAX_VALUE }
+        .thenBy { it.position }
+        .thenBy { it.title }
 
 @Composable
 private fun TemplateItemRow(item: ScheduleTemplateItemEntity) {
@@ -911,46 +958,38 @@ private fun TemplateEditorBottomSheet(
     onSave: (title: String, description: String?, items: List<TemplateRepository.TemplateItemInput>) -> Unit
 ) {
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
-    var title by remember(template?.id) { mutableStateOf(template?.title ?: "") }
-    var description by remember(template?.id) { mutableStateOf(template?.description ?: "") }
-    val itemStates = remember(template?.id) { mutableStateListOf<TemplateItemUi>() }
-    
-    val initializedId = remember { androidx.compose.runtime.mutableStateOf<String?>(null) }
-
-    LaunchedEffect(template?.id) {
-        
-        if (initializedId.value == template?.id) return@LaunchedEffect
-        initializedId.value = template?.id
-        itemStates.clear()
-        if (template != null) {
-            val mapped = initialItems
-                .filter { it.deletedAt == null }
-                .sortedWith(compareBy<ScheduleTemplateItemEntity> { it.weekday }.thenBy { it.position }.thenBy { it.title })
-                .map { entity ->
-                    TemplateItemUi().apply {
-                        id = entity.id
-                        weekday = entity.weekday
-                        title = entity.title
-                        description = entity.description ?: ""
-                        hasTime = entity.startTime != null
-                        startTime = entity.startTime?.let { TimeUtils.localTimeFromMillis(it) }
-                        priority = when (entity.priority) {
-                            TaskPriority.LOW.raw -> TaskPriority.LOW
-                            TaskPriority.HIGH.raw -> TaskPriority.HIGH
-                            else -> TaskPriority.MEDIUM
-                        }
-                        hasReminder = entity.hasReminder
-                        reminderOffsetMinutes = entity.reminderOffsetMinutes
-                        categoryId = entity.categoryId
-                    }
-                }
-            if (mapped.isNotEmpty()) {
-                itemStates.addAll(mapped)
+    var title by remember(template?.id, template?.updatedAt) { mutableStateOf(template?.title.orEmpty()) }
+    var description by remember(template?.id, template?.updatedAt) { mutableStateOf(template?.description.orEmpty()) }
+    val activeInitialItems = initialItems
+        .filter { it.deletedAt == null }
+        .sortedWith(templateItemComparator())
+    val initialItemsKey = activeInitialItems.joinToString("|") { "${it.id}:${it.updatedAt}:${it.deletedAt ?: 0L}" }
+    val itemStates = remember(template?.id, initialItemsKey) {
+        mutableStateListOf<TemplateItemUi>().apply {
+            if (template == null) {
+                add(TemplateItemUi())
             } else {
-                itemStates.add(TemplateItemUi())
+                addAll(
+                    activeInitialItems.map { entity ->
+                        TemplateItemUi().apply {
+                            id = entity.id
+                            weekday = entity.weekday
+                            this.title = entity.title
+                            this.description = entity.description ?: ""
+                            hasTime = entity.startTime != null
+                            startTime = entity.startTime?.let { TimeUtils.localTimeFromMillis(it) }
+                            priority = when (entity.priority) {
+                                TaskPriority.LOW.raw -> TaskPriority.LOW
+                                TaskPriority.HIGH.raw -> TaskPriority.HIGH
+                                else -> TaskPriority.MEDIUM
+                            }
+                            hasReminder = entity.hasReminder
+                            reminderOffsetMinutes = entity.reminderOffsetMinutes
+                            categoryId = entity.categoryId
+                        }
+                    }
+                )
             }
-        } else {
-            itemStates.add(TemplateItemUi())
         }
     }
 
@@ -973,9 +1012,9 @@ private fun TemplateEditorBottomSheet(
                             weekday = ui.weekday,
                             title = ui.title.trim(),
                             description = ui.description.trim().ifBlank { null },
-                            startTime = if (ui.hasTime) ui.startTime else null,
+                            startTime = if (ui.hasTime) ui.startTime ?: LocalTime.of(9, 0) else null,
                             priority = ui.priority.raw,
-                            hasReminder = ui.hasReminder && ui.hasTime && ui.startTime != null,
+                            hasReminder = ui.hasReminder && ui.hasTime,
                             reminderOffsetMinutes = ui.reminderOffsetMinutes,
                             categoryId = ui.categoryId
                         )
@@ -993,28 +1032,53 @@ private fun TemplateEditorBottomSheet(
             ) {
                 
                 SectionCard(title = "Основное") {
-                    IosField(value = title, onValueChange = { title = it }, placeholder = "Название шаблона")
+                    OutlinedTextField(
+                        value = title,
+                        onValueChange = { title = it },
+                        label = { Text("Название шаблона") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(12.dp)
+                    )
                     IosThinDivider()
-                    IosField(value = description, onValueChange = { description = it }, placeholder = "Описание (необязательно)", singleLine = false, minLines = 2)
+                    OutlinedTextField(
+                        value = description,
+                        onValueChange = { description = it },
+                        label = { Text("Описание шаблона") },
+                        singleLine = false,
+                        minLines = 2,
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(12.dp)
+                    )
                 }
 
                 
-                SectionCard(title = "Задачи в шаблоне") {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text(
+                        "ЗАДАЧИ В ШАБЛОНЕ",
+                        fontSize = 13.sp,
+                        color = AppColors.GrayText,
+                        fontWeight = FontWeight.Medium,
+                        modifier = Modifier.padding(start = 16.dp)
+                    )
                     itemStates.forEachIndexed { index, item ->
-                        if (index > 0) IosThinDivider()
-                        TemplateItemEditorCard(
-                            item = item,
-                            categories = categories,
-                            canRemove = itemStates.size > 1,
-                            onRemove = { itemStates.removeAt(index) }
-                        )
+                        androidx.compose.runtime.key(item.id) {
+                            TemplateItemEditorCard(
+                                item = item,
+                                categories = categories,
+                                canRemove = itemStates.size > 1,
+                                onRemove = { itemStates.removeAt(index) }
+                            )
+                        }
                     }
-                    IosThinDivider()
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
+                            .clip(RoundedCornerShape(14.dp))
+                            .background(Color.White)
+                            .border(BorderStroke(0.5.dp, AppColors.SeparatorLight), RoundedCornerShape(14.dp))
                             .clickable { itemStates.add(TemplateItemUi()) }
-                            .padding(vertical = 10.dp),
+                            .padding(horizontal = 14.dp, vertical = 12.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Icon(Icons.Filled.Add, contentDescription = null, tint = AppColors.Blue, modifier = Modifier.size(18.dp))
@@ -1052,9 +1116,16 @@ private fun TemplateItemEditorCard(
     val context = LocalContext.current
     var weekdayMenu by remember(item.id) { mutableStateOf(false) }
     var categoryMenu by remember(item.id) { mutableStateOf(false) }
-    var reminderMenu by remember(item.id) { mutableStateOf(false) }
 
-    Column(verticalArrangement = Arrangement.spacedBy(0.dp)) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(14.dp))
+            .background(Color.White)
+            .border(BorderStroke(0.5.dp, AppColors.SeparatorLight), RoundedCornerShape(14.dp))
+            .padding(horizontal = 14.dp, vertical = 8.dp),
+        verticalArrangement = Arrangement.spacedBy(0.dp)
+    ) {
         
         Row(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
             Text("День недели", modifier = Modifier.weight(1f), fontSize = 16.sp, color = AppColors.Label)
@@ -1077,10 +1148,25 @@ private fun TemplateItemEditorCard(
         }
         IosThinDivider()
         
-        IosField(value = item.title, onValueChange = { item.title = it }, placeholder = "Название задачи")
+        OutlinedTextField(
+            value = item.title,
+            onValueChange = { item.title = it },
+            label = { Text("Название задачи") },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
+            shape = RoundedCornerShape(12.dp)
+        )
         IosThinDivider()
         
-        IosField(value = item.description, onValueChange = { item.description = it }, placeholder = "Описание", singleLine = false, minLines = 2)
+        OutlinedTextField(
+            value = item.description,
+            onValueChange = { item.description = it },
+            label = { Text("Описание") },
+            singleLine = false,
+            minLines = 2,
+            modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
+            shape = RoundedCornerShape(12.dp)
+        )
         IosThinDivider()
         
         Row(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -1135,12 +1221,43 @@ private fun TemplateItemEditorCard(
         }
         if (item.hasTime) {
             IosThinDivider()
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable {
+                        val current = item.startTime ?: LocalTime.of(9, 0)
+                        TimePickerDialog(
+                            context,
+                            { _, hour, minute -> item.startTime = LocalTime.of(hour, minute) },
+                            current.hour,
+                            current.minute,
+                            true
+                        ).show()
+                    }
+                    .padding(vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("Время начала", modifier = Modifier.weight(1f), fontSize = 16.sp, color = AppColors.Label)
+                Text(
+                    "%02d:%02d".format((item.startTime ?: LocalTime.of(9, 0)).hour, (item.startTime ?: LocalTime.of(9, 0)).minute),
+                    color = AppColors.Blue,
+                    fontSize = 16.sp,
+                    fontWeight = FontWeight.Medium
+                )
+            }
+            IosThinDivider()
             Row(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
                 Text("Напоминание", modifier = Modifier.weight(1f), fontSize = 16.sp, color = AppColors.Label)
                 androidx.compose.material3.Switch(checked = item.hasReminder, onCheckedChange = { v: Boolean -> item.hasReminder = v }, enabled = item.startTime != null,
                     colors = androidx.compose.material3.SwitchDefaults.colors(
                         checkedThumbColor = Color.White, checkedTrackColor = AppColors.Green,
                         uncheckedThumbColor = Color.White, uncheckedTrackColor = Color(0xFFE5E5EA), uncheckedBorderColor = Color.Transparent))
+            }
+            if (item.hasReminder) {
+                ReminderOffsetChips(
+                    selected = item.reminderOffsetMinutes,
+                    onSelected = { item.reminderOffsetMinutes = it }
+                )
             }
         }
         if (canRemove) {
@@ -1226,7 +1343,6 @@ private fun RecurrenceEditorBottomSheet(
     var pickingEnd by remember { mutableStateOf(false) }
 
     var categoryMenu by remember { mutableStateOf(false) }
-    var reminderMenu by remember { mutableStateOf(false) }
     var frequencyMenu by remember { mutableStateOf(false) }
 
     LaunchedEffect(Unit) {
@@ -1353,6 +1469,13 @@ private fun RecurrenceEditorBottomSheet(
                         androidx.compose.material3.Switch(checked = hasReminder, onCheckedChange = { v: Boolean -> hasReminder = v },
                             enabled = hasTime,
                             colors = androidx.compose.material3.SwitchDefaults.colors(checkedThumbColor = Color.White, checkedTrackColor = AppColors.Green, uncheckedThumbColor = Color.White, uncheckedTrackColor = Color(0xFFE5E5EA), uncheckedBorderColor = Color.Transparent))
+                    }
+                    if (hasReminder && hasTime) {
+                        IosThinDivider()
+                        ReminderOffsetChips(
+                            selected = reminderOffsetMinutes,
+                            onSelected = { reminderOffsetMinutes = it }
+                        )
                     }
                 }
 
@@ -1518,6 +1641,36 @@ private fun reminderOffsetLabel(minutes: Int): String {
     }
 }
 
+@Composable
+private fun ReminderOffsetChips(selected: Int, onSelected: (Int) -> Unit) {
+    var expanded by remember { mutableStateOf(false) }
+    Box {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable { expanded = true }
+                .padding(top = 10.dp, bottom = 6.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text("Когда напомнить", modifier = Modifier.weight(1f), fontSize = 16.sp, color = AppColors.Label)
+            Text(reminderOffsetLabel(selected), color = AppColors.Blue, fontSize = 16.sp, fontWeight = FontWeight.Medium)
+            Icon(Icons.Filled.ExpandMore, null, tint = AppColors.Blue, modifier = Modifier.size(16.dp))
+        }
+        IosDropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+            listOf(0, 5, 10, 15, 30, 60).forEach { minutes ->
+                IosMenuItem(
+                    reminderOffsetLabel(minutes),
+                    Icons.Filled.AccessTime,
+                    if (selected == minutes) AppColors.Blue else AppColors.Label
+                ) {
+                    onSelected(minutes)
+                    expanded = false
+                }
+            }
+        }
+    }
+}
+
 private fun weekdayLong(day: Int): String {
     return when (day) {
         1 -> "Понедельник"
@@ -1551,6 +1704,13 @@ private fun ApplyTemplateBottomSheet(
     var showOverlapWarning by remember { mutableStateOf(false) }
     var pendingApplyStart by remember { mutableStateOf<java.time.LocalDate?>(null) }
     var pendingApplyEnd by remember { mutableStateOf<java.time.LocalDate?>(null) }
+
+    LaunchedEffect(appliedApplicationId) {
+        if (appliedApplicationId != null) {
+            kotlinx.coroutines.delay(800)
+            onDismiss()
+        }
+    }
 
     fun hasOverlap(start: LocalDate, end: LocalDate): Boolean {
         val startMs = com.taskplanner.android.core.util.TimeUtils.startOfDayMillis(start)
@@ -1588,12 +1748,39 @@ private fun ApplyTemplateBottomSheet(
                 }
             )
 
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 16.dp),
-                verticalArrangement = Arrangement.spacedBy(10.dp)
-            ) {
+            if (appliedApplicationId != null) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(300.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.Center
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(56.dp)
+                            .clip(CircleShape)
+                            .background(AppColors.Green),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(Icons.Filled.Check, contentDescription = null, tint = Color.White, modifier = Modifier.size(34.dp))
+                    }
+                    Spacer(Modifier.height(12.dp))
+                    Text("Шаблон применён!", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        "Создано задач: ${items.filter { it.deletedAt == null }.sumOf { countOccurrences(startDate, endDate, it.weekday) }}",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            } else {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
                 Text(template.title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
                 Spacer(modifier = Modifier.height(4.dp))
 
@@ -1642,9 +1829,11 @@ private fun ApplyTemplateBottomSheet(
                             sorted.forEach { item ->
                                 val count = countOccurrences(startDate, endDate, item.weekday)
                                 Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-                                    val color = item.categoryId
-                                        ?.let { id -> categories.firstOrNull { it.id == id }?.colorHex }
-                                        ?.let { colorFromHex(it) } ?: Color(0xFF0A84FF)
+                                    val color = when (TaskPriority.values().firstOrNull { it.raw == item.priority } ?: TaskPriority.MEDIUM) {
+                                        TaskPriority.HIGH -> AppColors.Red
+                                        TaskPriority.MEDIUM -> AppColors.Orange
+                                        TaskPriority.LOW -> AppColors.Green
+                                    }
                                     Box(
                                         modifier = Modifier
                                             .size(8.dp)
@@ -1669,6 +1858,7 @@ private fun ApplyTemplateBottomSheet(
                 }
 
                 // Кнопка отмены применения убрана
+                }
             }
         }
     }
@@ -1721,12 +1911,15 @@ private fun ApplyTemplateBottomSheet(
 private fun TemplateApplicationsBottomSheet(
     onDismiss: () -> Unit,
     applicationsFlow: () -> kotlinx.coroutines.flow.Flow<List<TemplateApplicationEntity>>,
+    tasksFlow: (applicationId: String) -> kotlinx.coroutines.flow.Flow<List<TaskEntity>>,
+    categories: List<CategoryEntity>,
     loadTaskCount: suspend (applicationId: String) -> Int,
     onDeleteApplication: (applicationId: String) -> Unit
 ) {
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     val applications by applicationsFlow().collectAsState(initial = emptyList())
     var pendingDelete by remember { mutableStateOf<TemplateApplicationEntity?>(null) }
+    var selectedApplication by remember { mutableStateOf<TemplateApplicationEntity?>(null) }
 
     ModalBottomSheet(
         onDismissRequest = onDismiss,
@@ -1734,54 +1927,71 @@ private fun TemplateApplicationsBottomSheet(
         containerColor = AppColors.SystemGroupedBackground,
         dragHandle = null
     ) {
-        Column(modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp)) {
-            SheetHeader(
-                title = "Запуски шаблона",
-                cancelText = "Готово",
-                confirmText = "",
-                confirmEnabled = false,
-                onCancel = onDismiss,
-                onConfirm = {}
+        if (selectedApplication != null) {
+            TemplateApplicationDetailContent(
+                application = selectedApplication!!,
+                tasksFlow = { tasksFlow(selectedApplication!!.id) },
+                categories = categories,
+                onBack = { selectedApplication = null }
             )
-
-            if (applications.isEmpty()) {
-                Text(
-                    "Этот шаблон ещё ни разу не применяли.",
-                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 24.dp),
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
+        } else {
+            Column(modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp)) {
+                SheetHeader(
+                    title = "Запуски шаблона",
+                    cancelText = "Готово",
+                    confirmText = "",
+                    confirmEnabled = false,
+                    onCancel = onDismiss,
+                    onConfirm = {}
                 )
-                return@ModalBottomSheet
-            }
 
-            LazyColumn(
-                modifier = Modifier.fillMaxWidth(),
-                contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
-                verticalArrangement = Arrangement.spacedBy(10.dp)
-            ) {
-                items(applications, key = { it.id }) { application ->
-                    val start = TimeUtils.localDateFromMillis(application.startDate).formatRussianLong()
-                    val end = TimeUtils.localDateFromMillis(application.endDate).formatRussianLong()
-                    val count = produceState<Int?>(initialValue = null, application.id) {
-                        value = loadTaskCount(application.id)
-                    }.value
+                if (applications.isEmpty()) {
+                    Text(
+                        "Этот шаблон ещё ни разу не применяли.",
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 24.dp),
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    return@ModalBottomSheet
+                }
 
-                    Surface(
-                        shape = RoundedCornerShape(14.dp),
-                        color = Color.White.copy(alpha = 0.25f),
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Row(
-                            modifier = Modifier.padding(12.dp),
-                            verticalAlignment = Alignment.CenterVertically
+                LazyColumn(
+                    modifier = Modifier.fillMaxWidth(),
+                    contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    items(applications, key = { it.id }) { application ->
+                        val start = TimeUtils.localDateFromMillis(application.startDate).formatRussianLong()
+                        val end = TimeUtils.localDateFromMillis(application.endDate).formatRussianLong()
+                        val count = produceState<Int?>(initialValue = null, application.id) {
+                            value = loadTaskCount(application.id)
+                        }.value
+
+                        Surface(
+                            shape = RoundedCornerShape(14.dp),
+                            color = Color.White.copy(alpha = 0.25f),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { selectedApplication = application }
                         ) {
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text("$start – $end", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
-                                val tasksText = count?.let { "Задач: $it" } ?: "Задач: …"
-                                Text(tasksText, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                            }
+                            Row(
+                                modifier = Modifier.padding(12.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text("$start – $end", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+                                    val tasksText = count?.let { "Задач: $it" } ?: "Задач: …"
+                                    Text(tasksText, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                }
 
-                            IconButton(onClick = { pendingDelete = application }) {
-                                Icon(Icons.Filled.Delete, contentDescription = "Удалить", tint = MaterialTheme.colorScheme.error)
+                                IconButton(onClick = { pendingDelete = application }) {
+                                    Icon(Icons.Filled.Delete, contentDescription = "Удалить", tint = MaterialTheme.colorScheme.error)
+                                }
+                                Icon(
+                                    Icons.Filled.ChevronRight,
+                                    contentDescription = null,
+                                    tint = AppColors.GrayText,
+                                    modifier = Modifier.size(20.dp)
+                                )
                             }
                         }
                     }
@@ -1807,6 +2017,206 @@ private fun TemplateApplicationsBottomSheet(
                 TextButton(onClick = { pendingDelete = null }) { Text("Отмена") }
             }
         )
+    }
+
+}
+
+private data class AppliedTemplateTaskGroup(
+    val id: String,
+    val weekday: Int,
+    val title: String,
+    val startTime: Long?,
+    val priority: TaskPriority,
+    val category: CategoryEntity?,
+    val createdCount: Int
+)
+
+@Composable
+@OptIn(ExperimentalMaterial3Api::class)
+private fun TemplateApplicationDetailContent(
+    application: TemplateApplicationEntity,
+    tasksFlow: () -> kotlinx.coroutines.flow.Flow<List<TaskEntity>>,
+    categories: List<CategoryEntity>,
+    onBack: () -> Unit
+) {
+    val tasks by tasksFlow().collectAsState(initial = emptyList())
+    val categoryById = remember(categories) { categories.associateBy { it.id } }
+    val taskGroups = remember(tasks, categoryById) {
+        buildAppliedTemplateTaskGroups(tasks, categoryById)
+    }
+    val groupedByWeekday = remember(taskGroups) {
+        taskGroups.groupBy { it.weekday }.toSortedMap()
+    }
+    val start = TimeUtils.localDateFromMillis(application.startDate).formatRussianLong()
+    val end = TimeUtils.localDateFromMillis(application.endDate).formatRussianLong()
+
+    Column(modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp)) {
+        SheetHeader(
+            title = "Применение",
+            cancelText = "Назад",
+            confirmText = "",
+            confirmEnabled = false,
+            onCancel = onBack,
+            onConfirm = {}
+        )
+
+        LazyColumn(
+            modifier = Modifier.fillMaxWidth(),
+            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            item {
+                Surface(
+                    shape = RoundedCornerShape(14.dp),
+                    color = Color.White.copy(alpha = 0.25f),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text("$start – $end", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+                        Text("Задач: ${tasks.size}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                }
+            }
+
+            if (taskGroups.isEmpty()) {
+                item {
+                    Surface(
+                        shape = RoundedCornerShape(14.dp),
+                        color = Color.White.copy(alpha = 0.25f),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text(
+                            "В этом применении шаблона задач не осталось.",
+                            modifier = Modifier.padding(16.dp),
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+            } else {
+                groupedByWeekday.forEach { (weekday, groups) ->
+                    item(key = "weekday-$weekday") {
+                        Text(
+                            weekdayTitle(weekday),
+                            modifier = Modifier.padding(top = 8.dp, start = 4.dp, bottom = 2.dp),
+                            style = MaterialTheme.typography.labelLarge,
+                            color = AppColors.GrayText,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    }
+                    items(groups, key = { it.id }) { group ->
+                        AppliedTemplateTaskRow(group)
+                    }
+                }
+            }
+        }
+    }
+}
+
+private fun buildAppliedTemplateTaskGroups(
+    tasks: List<TaskEntity>,
+    categoryById: Map<String, CategoryEntity>
+): List<AppliedTemplateTaskGroup> {
+    return tasks
+        .groupBy { task ->
+            val weekday = taskWeekday(task)
+            val timeKey = task.startTime?.let { TimeUtils.localTimeFromMillis(it).let { time -> time.hour * 60 + time.minute } } ?: -1
+            listOf(
+                weekday.toString(),
+                task.title,
+                timeKey.toString(),
+                task.priority.toString(),
+                task.categoryId.orEmpty()
+            ).joinToString("|")
+        }
+        .mapNotNull { (key, groupedTasks) ->
+            val first = groupedTasks.firstOrNull() ?: return@mapNotNull null
+            AppliedTemplateTaskGroup(
+                id = key,
+                weekday = taskWeekday(first),
+                title = first.title,
+                startTime = first.startTime,
+                priority = TaskPriority.values().firstOrNull { it.raw == first.priority } ?: TaskPriority.MEDIUM,
+                category = first.categoryId?.let { categoryById[it] },
+                createdCount = groupedTasks.size
+            )
+        }
+        .sortedWith(
+            compareBy<AppliedTemplateTaskGroup> { it.weekday }
+                .thenBy { group -> group.startTime?.let { TimeUtils.localTimeFromMillis(it).let { time -> time.hour * 60 + time.minute } } ?: Int.MAX_VALUE }
+                .thenBy { it.title }
+        )
+}
+
+private fun taskWeekday(task: TaskEntity): Int {
+    val date = TimeUtils.localDateFromMillis(task.instanceDate ?: task.date)
+    return date.dayOfWeek.value
+}
+
+@Composable
+private fun AppliedTemplateTaskRow(group: AppliedTemplateTaskGroup) {
+    val priorityColor = when (group.priority) {
+        TaskPriority.HIGH -> AppColors.Red
+        TaskPriority.MEDIUM -> AppColors.Orange
+        TaskPriority.LOW -> AppColors.Green
+    }
+    val category = group.category
+
+    Surface(
+        shape = RoundedCornerShape(14.dp),
+        color = Color.White.copy(alpha = 0.25f),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(10.dp)
+                    .clip(CircleShape)
+                    .background(priorityColor)
+            )
+            Spacer(Modifier.width(10.dp))
+            Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                Text(group.title, style = MaterialTheme.typography.bodyMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    if (group.startTime != null) {
+                        Icon(Icons.Filled.AccessTime, contentDescription = null, tint = AppColors.GrayText, modifier = Modifier.size(14.dp))
+                        Spacer(Modifier.width(4.dp))
+                        Text(TimeUtils.localTimeFromMillis(group.startTime).toString(), style = MaterialTheme.typography.bodySmall, color = AppColors.GrayText)
+                    } else {
+                        Text("Без времени", style = MaterialTheme.typography.bodySmall, color = AppColors.GrayText)
+                    }
+
+                    Text("  •  Создано: ${group.createdCount}", style = MaterialTheme.typography.bodySmall, color = AppColors.GrayText)
+
+                    if (category != null) {
+                        Text("  •  ", style = MaterialTheme.typography.bodySmall, color = AppColors.GrayText)
+                        Icon(
+                            categoryIcon(category.iconName) ?: Icons.Filled.Label,
+                            contentDescription = null,
+                            tint = colorFromHex(category.colorHex),
+                            modifier = Modifier.size(14.dp)
+                        )
+                        Spacer(Modifier.width(4.dp))
+                        Text(category.name, style = MaterialTheme.typography.bodySmall, color = AppColors.GrayText, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    }
+                }
+            }
+        }
+    }
+}
+
+private fun weekdayTitle(weekday: Int): String {
+    return when (weekday) {
+        1 -> "Понедельник"
+        2 -> "Вторник"
+        3 -> "Среда"
+        4 -> "Четверг"
+        5 -> "Пятница"
+        6 -> "Суббота"
+        7 -> "Воскресенье"
+        else -> "День $weekday"
     }
 }
 
@@ -2034,9 +2444,9 @@ private fun SectionCard(title: String, content: @Composable ColumnScope.() -> Un
         Box(
             modifier = Modifier
                 .fillMaxWidth()
-                .clip(RoundedCornerShape(12.dp))
+                .clip(RoundedCornerShape(14.dp))
                 .background(Color(0xFFFFFFFF))
-                .border(BorderStroke(1.dp, Color(0xFFE0E0E0)), RoundedCornerShape(12.dp))
+                .border(BorderStroke(0.5.dp, AppColors.SeparatorLight), RoundedCornerShape(14.dp))
         ) {
             Column(
                 modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp),
@@ -2057,9 +2467,9 @@ private val SF_TO_MATERIAL: Map<String, androidx.compose.ui.graphics.vector.Imag
     "person.fill" to Icons.Filled.Person,
     "briefcase.fill" to Icons.Filled.Work,
     "house.fill" to Icons.Filled.Home,
-    "book.fill" to Icons.Filled.School,
+    "book.fill" to Icons.Filled.MenuBook,
     "heart.fill" to Icons.Filled.Favorite,
-    "figure.run" to Icons.Filled.FitnessCenter,
+    "figure.run" to Icons.Filled.DirectionsRun,
     "paintpalette.fill" to Icons.Filled.Palette,
     "cart.fill" to Icons.Filled.ShoppingCart,
     "car.fill" to Icons.Filled.DirectionsCar,
